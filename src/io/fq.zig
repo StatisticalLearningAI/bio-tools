@@ -1,10 +1,5 @@
 const std = @import("std");
-
 const Block = struct { begin: u32, end: u32, next: u32 };
-
-inline fn is_carriage_return(c: u8) bool {
-    return c == '\r' or c == '\n';
-}
 
 fn str_next_line(index: usize, slice: []const u8) usize {
     var idx = index;
@@ -34,6 +29,40 @@ fn str_r_trim(slice: []const u8) []const u8 {
     return result;
 }
 
+inline fn is_carriage_return_char(c: u8) bool {
+    return c == '\r' or c == '\n';
+}
+
+inline fn is_empty_char(c: u8) bool {
+    return c == '\r' or c == '\n' or c == ' ';
+}
+
+fn stream_until_carriage_return(reader: anytype, writer: anytype) !void {
+    while (true) {
+        const byte: u8 = try reader.readByte();
+        if (is_carriage_return_char(byte)) return;
+        try writer.writeByte(byte);
+    }
+}
+
+fn str_trim(slice: []const u8) []const u8 {
+    if (slice.len == 0) return slice;
+    var left: usize = 0;
+    var right: usize = slice.len - 1;
+    while (left < right) {
+        if (is_empty_char(slice[left])) {
+            left += 1;
+            continue;
+        }
+        if (is_empty_char(slice[right])) {
+            right -= 1;
+            continue;
+        }
+        break;
+    }
+    return slice[left .. right + 1];
+}
+
 fn str_start_with_ignore_spaces(slice: []const u8, c: u8) ?u32 {
     var index: u32 = 0;
     while (index < slice.len) : (index += 1) {
@@ -46,7 +75,7 @@ fn str_start_with_ignore_spaces(slice: []const u8, c: u8) ?u32 {
 }
 
 const FqRowType = enum { None, Seq, Quality };
-fn resolve_line_type(slice: []const u8, offset: ?*usize) FqRowType {
+fn fq_line_type(slice: []const u8, offset: ?*usize) FqRowType {
     if (str_start_with_ignore_spaces(slice, '@')) |o| {
         if (offset) |of| (of.*) += o;
         return FqRowType.Seq;
@@ -64,10 +93,6 @@ fn to_record(name_: ?[]const u8, seq_: ?[]const u8, qual_: ?[]const u8) ?FqRecor
     return null;
 }
 
-const FqResult = enum {
-    FqSuccess,
-    FqMismatchedQualLength,
-};
 
 pub const FqRecord = struct {
     pub const FqArray = std.ArrayListAligned(u8, 16);
@@ -82,9 +107,9 @@ pub const FqRecord = struct {
         self.seq.resize(0) catch {};
     }
 
-    pub fn validate(self: *FqRecord) FqResult {
-        _ = self;
-        return FqResult.FqSuccess;
+    // qual and sequences should match 
+    pub fn isQualAndSeqValid(self: FqRecord) bool {
+        return self.qual.len > 0 and self.qual.len == self.seq.len;
     }
 
     pub fn deinit(self: *FqRecord) void {
@@ -102,55 +127,94 @@ pub const FqRecord = struct {
     }
 };
 
-const FqSliceIter = struct {
-    index: usize,
-    slice: []const u8,
-    pub fn read_next_record(self: *FqSliceIter, rec: *FqRecord) ?*FqRecord {
-        rec.clear();
-        var qual = false;
-        main: while (self.index < self.slice.len) {
-            switch (resolve_line_type(self.slice[self.index..], &self.index)) {
-                FqRowType.Quality => {
-                    qual = true;
-                    self.index = str_next_line(self.index, self.slice);
-                },
-                FqRowType.Seq => {
-                    if (rec.seq.items.len > 0)
-                        break :main;
-                    const next_idx = str_next_line((self.index + 1), self.slice);
-                    rec.name.appendSlice(str_r_trim(self.slice[(self.index + 1)..next_idx])) catch {};
-                    self.index = next_idx;
-                },
-                FqRowType.None => {
-                    const next_idx = str_next_line(self.index, self.slice);
+
+pub fn FqWriter(comptime Writer: type) type {
+    _ = Writer;
+    return struct {
+
+    };
+}
+
+pub fn FqReader(comptime Reader: type) type {
+    return struct {
+        reader: Reader,
+        start_read_name: bool,
+
+        const Self = @This();
+
+        pub fn read_next_record(self: *Self, rec: *FqRecord) (Reader.Error || error{ OutOfMemory, EndOfRecord })!void {
+            rec.clear();
+            var qual = false;
+            while (self.start_read_name) {
+                const b2: u8 = self.reader.readByte() catch |err| switch (err) {
+                    error.EndOfStream => return error.EndOfRecord,
+                    else => |e| return e,
+                };
+                if (is_carriage_return_char(b2)) break;
+                rec.name.append(b2) catch |err| return err;
+            }
+            self.start_read_name = false;
+
+            while (true) {
+                const byte: u8 = self.reader.readByte() catch |err| switch (err) {
+                    error.EndOfStream => return error.EndOfRecord,
+                    else => |e| return e,
+                };
+                if (is_empty_char(byte)) continue;
+                switch (byte) {
+                    '@' => {
+                        if (rec.seq.items.len > 0) {
+                            self.start_read_name = true;
+                            return; // we found a new sequence so terminate early
+                        }
+                        while (true) {
+                            const b2: u8 = self.reader.readByte() catch |err| switch (err) {
+                                error.EndOfStream => return,
+                                else => |e| return e,
+                            };
+                            if (is_carriage_return_char(b2)) break;
+                            rec.name.append(b2) catch |err| return err;
+                        }
+                    },
+                    '+' => {
+                        qual = true;
+                        try self.reader.skipUntilDelimiterOrEof('\n');
+                    },
+                    else => {},
+                }
+                while (true) {
+                    const b2 = self.reader.readByte() catch |err| switch (err) {
+                        error.EndOfStream => return,
+                        else => |e| return e,
+                    };
+                    if (is_carriage_return_char(b2)) break;
                     if (qual) {
-                        rec.qual.appendSlice(str_r_trim(self.slice[self.index..next_idx])) catch {};
+                        rec.qual.append(b2) catch |err| return err;
                     } else {
-                        rec.seq.appendSlice(str_r_trim(self.slice[self.index..next_idx])) catch {};
+                        rec.seq.append(b2) catch |err| return err;
                     }
-                    self.index = next_idx;
-                },
+                }
             }
         }
-        return rec;
-    }
+    };
+}
 
-    pub fn init(slice: []const u8) FqSliceIter {
-        return .{ .index = 0, .slice = slice };
-    }
-};
+pub fn fq_stream_reader(reader: anytype) FqReader(@TypeOf(reader)) {
+    return .{ .reader = reader, .start_read_name = false};
+}
 
 const testing = std.testing;
 test "fq_read_test" {
     const file = @embedFile("./files/t1.fq");
+    var stream = std.io.fixedBufferStream(file);
+
     var current = FqRecord.init(std.testing.allocator);
-    var iter = FqSliceIter.init(file);
-    if (iter.read_next_record(&current)) |rec| {
-        try testing.expectEqualStrings(rec.name.items, "HWI-D00523:240:HF3WGBCXX:1:1101:2574:2226 1:N:0:CTGTAG");
-    }
-    if (iter.read_next_record(&current)) |rec| {
-        try testing.expectEqualStrings(rec.name.items, "HWI-D00523:240:HF3WGBCXX:1:1101:5586:3020 1:N:0:CTGTAG");
-    }
+    var fq = fq_stream_reader(stream.reader());
+    // var iter = fq_slice_iter(file);
+    try fq.read_next_record(&current);
+    try testing.expectEqualStrings("HWI-D00523:240:HF3WGBCXX:1:1101:2574:2226 1:N:0:CTGTAG", current.name.items);
+    try fq.read_next_record(&current);
+    try testing.expectEqualStrings("HWI-D00523:240:HF3WGBCXX:1:1101:5586:3020 1:N:0:CTGTAG", current.name.items);
+
     current.deinit();
 }
-
