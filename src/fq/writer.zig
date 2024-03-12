@@ -51,7 +51,7 @@ pub fn FqWriter(comptime Stream: type, comptime options: Option) type {
 test "fq read test" {
     var buf = std.ArrayList(u8).init(std.testing.allocator);
     defer buf.deinit();
-    var writer = seq.fq.createWriter(&buf, .{});
+    var writer = seq.fq.fqWriter(&buf, .{});
     try writer.write_record(.{
         .name = "HWI-D00523:240:HF3WGBCXX:1:1101:2574:2226 1:N:0:CTGTAG",
         .seq = "TGAGGAATATTGGTCAATGGGCGCGAGCCTGAACCAGCCAAGTAGCGTGAAGGATGACTGCCCTACGGGTTGTAAACTTCTTTTATAAAGGAATAAAGTGAGGCACGTGTGCCTTTTTGTATGTACTTTATGAATAAGGATCGGCTAACTCCGTGCCAGCAGCCGCGGTAATACGGAGGATCCGAGCGTTATCCGGATTTATTGGGTTTAAAGGGTGCGCAGGCGGT",
