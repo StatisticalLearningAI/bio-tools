@@ -72,12 +72,11 @@ pub fn FqReader(comptime Stream: type, comptime options: FqReaderOption) type {
         }
 
         // seek to the record using FaiSlice 
-        pub fn seekUsingIndex(self: *Self, lookup: seq.fai.FqFaiIndex) (Stream.SeekableStream.Error)!void{
-            _ = lookup;
-            var seek = self.stream.seekableStream();
-            _ = seek;
-            
-        }
+       // pub fn seekUsingIndex(self: *Self, lookup: seq.fai.FqFaiIndex) (Stream.SeekableStream.Error)!void{
+       //     _ = lookup;
+       //     var seek = self.stream.seekableStream();
+       //     _ = seek;
+       // }
 
         pub fn next(self: *Self) (Stream.Reader.Error || error{ OutOfMemory, MismatchedQualAndSeq, MalformedIdentifier })!?FqIterator {
             self.stage.shrinkRetainingCapacity(0);

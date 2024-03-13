@@ -11,8 +11,8 @@ pub const SeqContianer = enum {
         }
     }
 
-    pub const fastq_ext= [_]u8{"fq"};
-    pub const fasta_ext = [_]u8{"fa"};
+    pub const fastq_ext= [_]u8{"fq", "fasta"};
+    pub const fasta_ext = [_]u8{"fa", "fastq"};
 
     fn ext(con: SeqContianer) [][] const u8 {
         switch (con) {
