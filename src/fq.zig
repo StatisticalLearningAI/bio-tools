@@ -2,7 +2,7 @@ const seq = @import("./seq.zig");
 const std = @import("std");
 const testing = std.testing;
 
-pub const Entry = struct {
+pub const FqEntry = struct {
     name: []const u8,
     qual: []const u8,
     seq: []const u8,
@@ -18,7 +18,7 @@ pub fn FqWriter(comptime Stream: type, comptime options: FqWriteOption) type {
         const Self = @This();
         stream: *Stream,
         pub const WriterError = Stream.Writer.Error;
-        pub fn write_record(self: *Self, slice: seq.fq.Entry) Stream.Writer.Error!void {
+        pub fn write_record(self: *Self, slice: seq.fq.FqEntry) Stream.Writer.Error!void {
             var fq = if(@hasField(Stream, "fq")) self.stream.fq.writer() else self.stream.writer();
 
             try fq.writeByte('@');
@@ -64,19 +64,19 @@ pub fn FqReader(comptime Stream: type, comptime options: FqReaderOption) type {
             seq_offset: usize, // offset in the reader
             sequence_len: usize, // the number of bases in the sequence
             qual_offset: u64,
-            entry: seq.fq.Entry
+            entry: seq.fq.FqEntry
         }; 
 
         pub fn deinit(self: *Self) void {
             self.stage.deinit();
         }
 
-        // seek to the record using FaiSlice 
-       // pub fn seekUsingIndex(self: *Self, lookup: seq.fai.FqFaiIndex) (Stream.SeekableStream.Error)!void{
-       //     _ = lookup;
-       //     var seek = self.stream.seekableStream();
-       //     _ = seek;
-       // }
+        // seek to the record using FaiEntry
+        pub fn readUsingFai(self: *Self, fai: anytype) (Stream.SeekableStream.Error)!void{
+            _ = fai;
+            var seek = self.stream.seekableStream();
+            _ = seek;
+        }
 
         pub fn next(self: *Self) (Stream.Reader.Error || error{ OutOfMemory, MismatchedQualAndSeq, MalformedIdentifier })!?FqIterator {
             self.stage.shrinkRetainingCapacity(0);

@@ -9,7 +9,7 @@ const ColumnIdx = enum(u8) { name = 0, length = 1, offset = 2, line_bases = 3, l
 pub fn FaiEntry(comptime container: seq.SeqContianer, comptime reserved_len: usize) type {
     return switch (container) {
         .fastq => struct {
-            pub const NumberOfColumns = 6;
+            pub const number_of_col = 6;
 
             name: if (reserved_len == 0) []const u8 else [reserved_len:0]u8,
             length: u32,
@@ -19,7 +19,7 @@ pub fn FaiEntry(comptime container: seq.SeqContianer, comptime reserved_len: usi
             qual_offset: u64,
         },
         .fasta => struct {
-            pub const NumberOfColumns = 5;
+            pub const number_of_col= 5;
 
             name: if (reserved_len == 0) []const u8 else [reserved_len:0]u8,
             length: u32,
@@ -50,7 +50,8 @@ pub fn FaiReader(comptime Stream: type, comptime option: FaiReaderOption) type {
         pub const Iterable = FaiEntry(option.container, 0);
 
         const Self = @This();
-        pub fn next(self: *Self) (error{ UnexpectedNumColumn, InvalidCharacter, Overflow })!?Iterable {
+        pub fn  next(self: *Self)  (error{ UnexpectedNumberColum, Overflow, ParseError})!?Iterable  {
+            try self.stage.resize(0);
             var reader = self.stream.reader();
             var col: u8 = 0;
 
@@ -61,50 +62,51 @@ pub fn FaiReader(comptime Stream: type, comptime option: FaiReaderOption) type {
             var line_width: u32 = 0;
             var qual_offset: u64 = 0;
 
-            blk: while (true) {
+            while (true) {
                 const byte: u8 = reader.readByte() catch |err| switch (err) {
-                    error.EndOfStream => return null, // the buffer is exausted 
+                    error.EndOfStream => return null, // the buffer is exausted
                     else => |e| return e,
                 };
-                switch (byte) {
+                 switch (byte)  {
                     // skip \r
                     std.ascii.control_code.cr => break,
                     // horizontal tab
-                    std.ascii.control_code.ht => {
+                    std.ascii.control_code.ht, std.ascii.control_code.lf => l: {
+                        // line feed \n
+                        if(std.ascii.control_code.lf == byte and col == 0) break :l; // if number of col is 0 then this is an empty row skip
                         switch (comptime option.container) {
                             .fastq => {
                                 switch (@as(ColumnIdx, @enumFromInt(col))) {
                                     ColumnIdx.name => name_len = self.stage.len,
-                                    ColumnIdx.length => length = try std.fmt.parseUnsigned(u32, self.stage.slice()[name_len..], 10),
-                                    ColumnIdx.offset => offset = try std.fmt.parseUnsigned(u64, self.stage.slice()[name_len..], 10),
-                                    ColumnIdx.line_bases => line_base = try std.fmt.parseUnsigned(u32, self.stage.slice()[name_len..], 10),
-                                    ColumnIdx.line_width => line_width = try std.fmt.parseUnsigned(u32, self.stage.slice()[name_len..], 10),
-                                    ColumnIdx.qual_offset => qual_offset = try std.fmt.parseUnsigned(u64, self.stage.slice()[name_len..], 10),
-                                    else => unreachable
+                                    ColumnIdx.length => length = std.fmt.parseUnsigned(u32, self.stage.slice()[name_len..], 10) catch return error.ParseError,
+                                    ColumnIdx.offset => offset = std.fmt.parseUnsigned(u64, self.stage.slice()[name_len..], 10) catch return error.ParseError,
+                                    ColumnIdx.line_bases => line_base = std.fmt.parseUnsigned(u32, self.stage.slice()[name_len..], 10) catch return error.ParseError,
+                                    ColumnIdx.line_width => line_width = std.fmt.parseUnsigned(u32, self.stage.slice()[name_len..], 10) catch return error.ParseError,
+                                    ColumnIdx.qual_offset => qual_offset = std.fmt.parseUnsigned(u64, self.stage.slice()[name_len..], 10) catch return error.ParseError,
                                 }
                             },
                             .fasta => {
                                 switch (@as(ColumnIdx, @enumFromInt(col))) {
                                     ColumnIdx.name => name_len = self.stage.len,
-                                    ColumnIdx.length => length = try std.fmt.parseUnsigned(u32, self.stage.slice()[name_len..], 10),
-                                    ColumnIdx.offset => offset = try std.fmt.parseUnsigned(u64, self.stage.slice()[name_len..], 10),
-                                    ColumnIdx.line_bases => line_base = try std.fmt.parseUnsigned(u32, self.stage.slice()[name_len..], 10),
-                                    ColumnIdx.line_width => line_width = try std.fmt.parseUnsigned(u32, self.stage.slice()[name_len..], 10),
-                                    else => unreachable
+                                    ColumnIdx.length => length = std.fmt.parseUnsigned(u32, self.stage.slice()[name_len..], 10) catch return error.ParseError,
+                                    ColumnIdx.offset => offset = std.fmt.parseUnsigned(u64, self.stage.slice()[name_len..], 10) catch return error.ParseError,
+                                    ColumnIdx.line_bases => line_base = std.fmt.parseUnsigned(u32, self.stage.slice()[name_len..], 10) catch return error.ParseError,
+                                    ColumnIdx.line_width => line_width = std.fmt.parseUnsigned(u32, self.stage.slice()[name_len..], 10) catch return error.ParseError,
+                                    else => return error.UnexpectedNumberColum
                                 }
                             },
                             else => unreachable,
                         }
-                        try self.stage.resize(name_len);
+                        self.stage.resize(name_len) catch unreachable;
                         col += 1;
-                    },
-                    // line feed \n
-                    std.ascii.control_code.lf => {
-                        break :blk;
+                        
+                        if(std.ascii.control_code.lf == byte) break; // we terminate
+                        
                     },
                     else => try self.stage.append(byte),
                 }
             }
+            if(col != Iterable.number_of_col) return error.UnexpectedNumberColum; // the column
             
             return switch (comptime option.container) {
                 .fastq => .{
@@ -132,12 +134,57 @@ pub fn faiReader(stream: anytype, comptime option: FaiReaderOption) FaiReader(@T
     return .{ .stream = stream, .stage = .{} };
 }
 
-test "test read fa records" {
+test "fastq parse fai index" { 
+    const file = @embedFile("./test/t3.fq.fai");
+    var stream = std.io.fixedBufferStream(file);
+    var reader = faiReader(stream, .{ .container = seq.SeqContianer.fastq });
+    const test_cases = 
+        [_]FaiEntry(seq.SeqContianer.fastq, 0){
+        .{.name = "FAKE0005_1", .length=63, .offset=85, .line_base=63, .line_width=64, .qual_offset=151},
+        .{.name = "FAKE0006_1", .length=63, .offset=300, .line_base=63, .line_width=64, .qual_offset=366},
+        .{.name = "FAKE0005_2", .length=63, .offset=515, .line_base=63, .line_width=64, .qual_offset=581},
+        .{.name = "FAKE0006_2", .length=63, .offset=730, .line_base=63, .line_width=64, .qual_offset=796},
+        .{.name = "FAKE0005_3", .length=63, .offset=945, .line_base=63, .line_width=64, .qual_offset=1011},
+        .{.name = "FAKE0006_3", .length=63, .offset=1160, .line_base=63, .line_width=64, .qual_offset=1226},
+        .{.name = "FAKE0005_4", .length=63, .offset=1375, .line_base=63, .line_width=64, .qual_offset=1441},
+        .{.name = "FAKE0006_4", .length=63, .offset=1590, .line_base=63, .line_width=64, .qual_offset=1656},
+    };
+
+    for(test_cases) |case| {
+        if (try reader.next()) |result| {
+            try testing.expectEqualStrings(case.name, result.name);
+            try testing.expectEqual(@as(u64, case.length), result.length);
+            try testing.expectEqual(@as(u64, case.offset), result.offset);
+            try testing.expectEqual(@as(u32, case.line_base), result.line_base);
+            try testing.expectEqual(@as(u32, case.line_width), result.line_width);
+        } else try testing.expect(false);
+    }
+}
+
+test "fasta parse fai index" {
     const file = @embedFile("./test/ce.fa.fai");
     var stream = std.io.fixedBufferStream(file);
     var reader = faiReader(stream, .{ .container = seq.SeqContianer.fasta });
 
-    if (try reader.next()) |result| {
-        try testing.expectEqual(@as(u64, 1009800), result.length);
-    } else try testing.expect(false);
+    const test_cases = 
+        [_]FaiEntry(seq.SeqContianer.fasta, 0){
+        .{.name = "CHROMOSOME_I", .length=1009800, .offset=14, .line_base=50, .line_width = 51 },
+        .{.name = "CHROMOSOME_II", .length=5000, .offset=1030025, .line_base=50, .line_width = 51 },
+        .{.name = "CHROMOSOME_III", .length=5000, .offset=1035141, .line_base=50, .line_width = 51 },
+        .{.name = "CHROMOSOME_IV", .length=5000, .offset=1040256, .line_base=50, .line_width = 51 },
+        .{.name = "CHROMOSOME_V", .length=5000, .offset=1045370, .line_base=50, .line_width = 51 },
+        .{.name = "CHROMOSOME_X", .length=5000, .offset=1050484, .line_base=50, .line_width = 51 },
+        .{.name = "CHROMOSOME_MtDNA", .length=5000, .offset=1055602, .line_base=50, .line_width = 51 }
+    };
+
+    for(test_cases) |case| {
+        if (try reader.next()) |result| {
+            try testing.expectEqualStrings(case.name, result.name);
+            try testing.expectEqual(@as(u64, case.length), result.length);
+            try testing.expectEqual(@as(u64, case.offset), result.offset);
+            try testing.expectEqual(@as(u32, case.line_base), result.line_base);
+            try testing.expectEqual(@as(u32, case.line_width), result.line_width);
+        } else try testing.expect(false);
+    }
+    try testing.expectEqual(@as(?FaiEntry(seq.SeqContianer.fasta,0), null), try reader.next()); // we ran out of records
 }
