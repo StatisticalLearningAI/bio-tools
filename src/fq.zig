@@ -2,14 +2,11 @@ const seq = @import("./seq.zig");
 const std = @import("std");
 const testing = std.testing;
 
-pub const FqEntry = struct {
-    name: []const u8,
-    qual: []const u8,
-    seq: []const u8,
-};
-
 pub const FqWriteOption = struct {
-    repeatNameForQual: bool = false,
+    lineEnding: enum {
+       crlf,
+       lf 
+    } = .lf,
 };
 
 pub fn FqWriter(comptime Stream: type) type {
@@ -20,7 +17,7 @@ pub fn FqWriter(comptime Stream: type) type {
         options: FqWriteOption,
         pub const WriterError = Stream.Writer.Error;
 
-        pub fn write_record(self: *Self, slice: seq.fq.FqEntry) Stream.Writer.Error!void {
+        pub fn write_record(self: *Self, slice: anytype) Stream.Writer.Error!void {
             var fq = self.stream.writer();
 
             try fq.writeByte('@');
@@ -31,9 +28,6 @@ pub fn FqWriter(comptime Stream: type) type {
             try fq.writeByte('\n');
 
             try fq.writeByte('+');
-            if (self.options.repeatNameForQual) {
-                try fq.writeAll(slice.name);
-            }
             try fq.writeByte('\n');
 
             try fq.writeAll(slice.qual);
@@ -55,15 +49,8 @@ pub fn FqReader(comptime Stream: type) type {
         stage: std.ArrayList(u8),
         const Self = @This();
 
-        pub const ParseErrors = error{ MalformedIdentifier, UnexpectedBasesPerLine, UnexpectedBytesPerLine, QualAndSeqMismatch, QualAndSeqLineMismatch };
+        pub const ParseErrors = error{ RecordParseError };
         pub const Container = seq.SeqContianer.fastq;
-        pub const FqIterator = struct {
-            seq_offset: usize, // offset in the reader
-            sequence_len: usize, // the number of bases in the sequence
-            qual_offset: u64,
-            //fai: seq.fai.FaiEntry(.fastq, .{}),
-            entry: seq.fq.FqEntry,
-        };
 
         pub fn deinit(self: *Self) void {
             self.stage.deinit();
@@ -72,7 +59,11 @@ pub fn FqReader(comptime Stream: type) type {
         // optional parameters for readining index
         pub const ReadUsingIndexOptions = struct { skip_qual: bool = false };
         // seek to the record using FaiEntry
-        pub fn readUsingIndex(self: *Self, fai: anytype, comptime options: ReadUsingIndexOptions) (Stream.SeekError || error{ OutOfMemory, EndOfStream })!seq.fq.FqEntry {
+        pub fn readUsingIndex(self: *Self, fai: anytype, comptime options: ReadUsingIndexOptions) (Stream.SeekError || error{ OutOfMemory, EndOfStream })!struct {
+            name: []const u8,
+            qual: []const u8,
+            seq: []const u8,
+        } {
             self.stage.shrinkRetainingCapacity(0);
             var seek = self.stream.seekableStream();
             var reader = self.stream.reader();
@@ -112,24 +103,39 @@ pub fn FqReader(comptime Stream: type) type {
             };
         }
 
-        pub fn next(self: *Self) (Stream.Reader.Error || ParseErrors || error{OutOfMemory})!?FqIterator {
+        pub const ParseOptions = struct {
+
+        };
+
+        pub fn next(self: *Self, comptime options: ParseOptions) (Stream.Reader.Error || ParseErrors || error{OutOfMemory})!?struct {
+            length: u32,      // Total length of this reference sequence, in bases
+            offset: usize,      // Offset in the FASTA/FASTQ file of this sequence's first base
+            line_base: u32,   // The number of bases on each line
+            line_width: u32,  // The number of bytes in each line, including the newline
+            qual_offset: usize, // Offset of sequence's first quality within the FASTQ file
+
+            name: []const u8,
+            qual: []const u8,
+            seq: []const u8,
+        } {
+            _ = options;
             self.stage.shrinkRetainingCapacity(0);
             var seq_read_offset: usize = 0;
             var qual_read_offset: usize = 0;
 
             var reader = self.stream.reader();
 
-            var state: enum { start, name, seq, seq_start, qual, qual_start } = .start;
+            var state: enum { start, name, seq, seq_begin, qual, qual_start } = .start;
 
             var name_len: usize = 0;
-            var seq_len: usize = 0;
-            var qual_len: usize = 0;
+            var seq_len: u32 = 0;
+            var qual_len: u64 = 0;
 
-            var bases_per_line: usize = 0;
-            var expected_bases_per_line: ?usize = null;
+            var bases_per_line: u32 = 0;
+            var expected_bases_per_line: ?u32 = null;
 
-            var bytes_per_line: usize = 0;
-            var expected_bytes_per_line: ?usize = null;
+            var bytes_per_line: u32 = 0;
+            var expected_bytes_per_line: ?u32 = null;
 
             var seq_num_lines: usize = 0;
             var qual_num_lines: usize = 0;
@@ -143,7 +149,7 @@ pub fn FqReader(comptime Stream: type) type {
                         };
                         state = switch (byte) {
                             '@' => .name,
-                            else => return error.MalformedIdentifier,
+                            else => return error.RecordParseError,
                         };
                     },
                     .name => {
@@ -153,7 +159,7 @@ pub fn FqReader(comptime Stream: type) type {
                         };
                         state = switch (byte) {
                             '\r' => state, // ignore \r characters
-                            '\n' => .seq_start, // end of the line
+                            '\n' => .seq_begin, // end of the line
                             else => l: {
                                 try self.stage.append(byte);
                                 name_len += 1;
@@ -161,39 +167,45 @@ pub fn FqReader(comptime Stream: type) type {
                             },
                         };
                     },
-                    .seq_start => {
+                    .seq_begin => {
                         const byte: u8 = reader.readByte() catch |err| switch (err) {
-                            error.EndOfStream => continue :finished, // we just have a name so the buffer is malformed
+                            error.EndOfStream => '\n', // we just have a name so the buffer is malformed
                             else => |e| return e,
                         };
                         state = switch (byte) {
                             '+' => .qual_start,
+                            '\n', '\r' =>  return error.RecordParseError,
                             else => l: {
-                                if (expected_bases_per_line) |e| if (e != bases_per_line) return error.UnexpectedBasesPerLine;
-                                if (expected_bytes_per_line) |e| if (e != bytes_per_line) return error.UnexpectedBytesPerLine;
-                                bases_per_line = 0;
-                                bytes_per_line = 0;
+                                if (expected_bytes_per_line) |e| 
+                                    if (e != bytes_per_line) return error.RecordParseError;
+                                 
+                                if (expected_bases_per_line) |e| 
+                                    if (e != bases_per_line) return error.RecordParseError;
 
-                                seq_read_offset = try self.stream.seekableStream().getPos();
-                                try self.stage.append(byte);
+                                bases_per_line = 1;
+                                bytes_per_line = 1;
                                 seq_len += 1;
+                                try self.stage.append(byte);
+                                
                                 break :l .seq;
                             },
                         };
                     },
-                    .seq => {
+                    .seq =>  {
+
                         const byte: u8 = reader.readByte() catch |err| switch (err) {
                             error.EndOfStream => return null, // we just have a name so the buffer is malformed
                             else => |e| return e,
                         };
                         bytes_per_line += 1;
                         state = switch (byte) {
+                            '+' => .qual_start,
                             '\r' => state,
                             '\n' => l: {
                                 seq_num_lines += 1;
-                                if (expected_bases_per_line == null) expected_bases_per_line = bases_per_line;
-                                if (expected_bytes_per_line == null) expected_bytes_per_line = bytes_per_line;
-                                break :l .seq_start;
+                                if (expected_bases_per_line == null ) expected_bases_per_line = bases_per_line;
+                                if (expected_bytes_per_line == null ) expected_bytes_per_line = bytes_per_line;
+                                break :l .seq_begin;
                             },
                             else => l: {
                                 bases_per_line += 1;
@@ -215,11 +227,12 @@ pub fn FqReader(comptime Stream: type) type {
                                 // '@' and '+' can show up in qualifiers
                                 //   the number of sequence characters has to equal qualifiers
                                 if (qual_len == seq_len) break :finished;
-                                if (qual_len > seq_len) return error.QualAndSeqMismatch;
+                                if (qual_len > seq_len) return error.RecordParseError;
                                 break :l .qual;
                             },
                             else => l: {
-                                if (state == .qual_start) qual_read_offset = try self.stream.seekableStream().getPos();
+                                if (state == .qual_start )
+                                    qual_read_offset = try self.stream.seekableStream().getPos();
 
                                 try self.stage.append(byte);
                                 qual_len += 1;
@@ -231,9 +244,19 @@ pub fn FqReader(comptime Stream: type) type {
             }
 
             if (qual_num_lines != seq_num_lines)
-                return error.QualAndSeqLineMismatch;
+                return error.RecordParseError ;
 
-            return .{ .seq_offset = seq_read_offset, .qual_offset = qual_read_offset, .sequence_len = seq_len, .entry = .{ .name = self.stage.items[0..name_len], .seq = self.stage.items[name_len .. name_len + seq_len], .qual = self.stage.items[name_len + seq_len .. qual_len + seq_len + name_len] } };
+            return .{ 
+                .length = seq_len,
+                .offset = seq_read_offset,
+                .line_base = bases_per_line,
+                .line_width = bytes_per_line,
+                .qual_offset = qual_read_offset,
+
+                .name = self.stage.items[0..name_len], 
+                .seq = self.stage.items[name_len .. name_len + seq_len], 
+                .qual = self.stage.items[name_len + seq_len .. qual_len + seq_len + name_len] 
+            };
         }
     };
 }
@@ -268,17 +291,17 @@ test "read fq records t1.fq" {
     var stream = std.io.fixedBufferStream(file);
     var fqReadIter = seq.fq.fqReader(std.testing.allocator, stream);
     defer fqReadIter.deinit();
-    if (try fqReadIter.next()) |result| {
-        try testing.expectEqualStrings("HWI-D00523:240:HF3WGBCXX:1:1101:2574:2226 1:N:0:CTGTAG", result.entry.name);
-        try testing.expectEqualStrings("TGAGGAATATTGGTCAATGGGCGCGAGCCTGAACCAGCCAAGTAGCGTGAAGGATGACTGCCCTACGGGTTGTAAACTTCTTTTATAAAGGAATAAAGTGAGGCACGTGTGCCTTTTTGTATGTACTTTATGAATAAGGATCGGCTAACTCCGTGCCAGCAGCCGCGGTAATACGGAGGATCCGAGCGTTATCCGGATTTATTGGGTTTAAAGGGTGCGCAGGCGGT", result.entry.seq);
+    if (try fqReadIter.next(.{})) |result| {
+        try testing.expectEqualStrings("HWI-D00523:240:HF3WGBCXX:1:1101:2574:2226 1:N:0:CTGTAG", result.name);
+        try testing.expectEqualStrings("TGAGGAATATTGGTCAATGGGCGCGAGCCTGAACCAGCCAAGTAGCGTGAAGGATGACTGCCCTACGGGTTGTAAACTTCTTTTATAAAGGAATAAAGTGAGGCACGTGTGCCTTTTTGTATGTACTTTATGAATAAGGATCGGCTAACTCCGTGCCAGCAGCCGCGGTAATACGGAGGATCCGAGCGTTATCCGGATTTATTGGGTTTAAAGGGTGCGCAGGCGGT", result.seq);
     } else try testing.expect(false);
 
-    if (try fqReadIter.next()) |result| {
-        try testing.expectEqualStrings("HWI-D00523:240:HF3WGBCXX:1:1101:5586:3020 1:N:0:CTGTAG", result.entry.name);
+    if (try fqReadIter.next(.{})) |result| {
+        try testing.expectEqualStrings("HWI-D00523:240:HF3WGBCXX:1:1101:5586:3020 1:N:0:CTGTAG", result.name);
     } else try testing.expect(false);
 
-    if (try fqReadIter.next()) |result| {
-        try testing.expectEqualStrings("HWI-D00523:240:HF3WGBCXX:1:1101:2860:2149 1:N:0:CTGTAG", result.entry.name);
+    if (try fqReadIter.next(.{})) |result| {
+        try testing.expectEqualStrings("HWI-D00523:240:HF3WGBCXX:1:1101:2860:2149 1:N:0:CTGTAG", result.name);
     } else try testing.expect(false);
 }
 
