@@ -55,6 +55,7 @@ pub fn FqReader(comptime Stream: type) type {
         stage: std.ArrayList(u8),
         const Self = @This();
 
+        pub const ParseErrors = error{ MalformedIdentifier, UnexpectedBasesPerLine, UnexpectedBytesPerLine, QualAndSeqMismatch, QualAndSeqLineMismatch };
         pub const Container = seq.SeqContianer.fastq;
         pub const FqIterator = struct {
             seq_offset: usize, // offset in the reader
@@ -69,64 +70,69 @@ pub fn FqReader(comptime Stream: type) type {
         }
 
         // optional parameters for readining index
-        pub const ReadUsingIndexOptions = struct {
-           skip_qual: bool = false
-        };
+        pub const ReadUsingIndexOptions = struct { skip_qual: bool = false };
         // seek to the record using FaiEntry
-        pub fn readUsingIndex(self: *Self, fai: anytype, comptime options: ReadUsingIndexOptions) (Stream.SeekError || error{OutOfMemory, EndOfStream})!seq.fq.FqEntry {
+        pub fn readUsingIndex(self: *Self, fai: anytype, comptime options: ReadUsingIndexOptions) (Stream.SeekError || error{ OutOfMemory, EndOfStream })!seq.fq.FqEntry {
             self.stage.shrinkRetainingCapacity(0);
             var seek = self.stream.seekableStream();
             var reader = self.stream.reader();
-            
+
             {
                 try seek.seekTo(fai.offset); // seek to the offset of the fai
                 var remaining_bases: usize = fai.length;
                 while (remaining_bases > 0) {
                     const bases_to_read = @min(fai.line_base, remaining_bases);
                     try self.stage.ensureTotalCapacity(self.stage.items.len + bases_to_read);
-                    const bases_read = try reader.read(self.stage.unusedCapacitySlice()[0..bases_to_read]);
-                    if (bases_read < bases_to_read)
+                    const bytes_read = try reader.read(self.stage.unusedCapacitySlice()[0..bases_to_read]);
+                    if (bytes_read < bases_to_read)
                         return error.EndOfStream;
-                    self.stage.items.len += bases_read;
-                    remaining_bases -= bases_read;
-                    try reader.skipBytes(fai.line_width - fai.line_base, .{.buf_size = 16});
+                    self.stage.items.len += bytes_read;
+                    remaining_bases -= bytes_read;
+                    try reader.skipBytes(fai.line_width - fai.line_base, .{ .buf_size = 16 });
                 }
             }
-            if(!options.skip_qual) {
+            if (!options.skip_qual) {
                 try seek.seekTo(fai.qual_offset); // seek to the offset of the fai
                 var remaining_qual: usize = fai.length;
                 while (remaining_qual > 0) {
                     const bases_to_read = @min(fai.line_base, remaining_qual);
                     try self.stage.ensureTotalCapacity(self.stage.items.len + bases_to_read);
-                    const bases_read = try reader.read(self.stage.unusedCapacitySlice()[0..bases_to_read]);
-                    if (bases_read < bases_to_read)
+                    const bytes_read = try reader.read(self.stage.unusedCapacitySlice()[0..bases_to_read]);
+                    if (bytes_read < bases_to_read)
                         return error.EndOfStream;
-                    self.stage.items.len += bases_read;
-                    remaining_qual -= bases_read;
-                    try reader.skipBytes(fai.line_width - fai.line_base, .{.buf_size = 16});
+                    self.stage.items.len += bytes_read;
+                    remaining_qual -= bytes_read;
+                    try reader.skipBytes(fai.line_width - fai.line_base, .{ .buf_size = 16 });
                 }
             }
             return .{
                 .name = fai.name,
                 .seq = self.stage.items[0..fai.length],
-                .qual = if(options.skip_qual) .{} else self.stage.items[fai.length..fai.length + fai.length],
+                .qual = if (options.skip_qual) .{} else self.stage.items[fai.length .. fai.length + fai.length],
             };
         }
 
-        pub fn next(self: *Self) (Stream.Reader.Error || error{ OutOfMemory, MismatchedQualAndSeq, MalformedIdentifier })!?FqIterator {
+        pub fn next(self: *Self) (Stream.Reader.Error || ParseErrors || error{OutOfMemory})!?FqIterator {
             self.stage.shrinkRetainingCapacity(0);
             var seq_read_offset: usize = 0;
             var qual_read_offset: usize = 0;
 
             var reader = self.stream.reader();
 
-            var count_seq: u32 = 0;
-            var count_qul: u32 = 0;
             var state: enum { start, name, seq, seq_start, qual, qual_start } = .start;
 
             var name_len: usize = 0;
             var seq_len: usize = 0;
             var qual_len: usize = 0;
+
+            var bases_per_line: usize = 0;
+            var expected_bases_per_line: ?usize = null;
+
+            var bytes_per_line: usize = 0;
+            var expected_bytes_per_line: ?usize = null;
+
+            var seq_num_lines: usize = 0;
+            var qual_num_lines: usize = 0;
 
             finished: while (true) {
                 switch (state) {
@@ -163,8 +169,12 @@ pub fn FqReader(comptime Stream: type) type {
                         state = switch (byte) {
                             '+' => .qual_start,
                             else => l: {
+                                if (expected_bases_per_line) |e| if (e != bases_per_line) return error.UnexpectedBasesPerLine;
+                                if (expected_bytes_per_line) |e| if (e != bytes_per_line) return error.UnexpectedBytesPerLine;
+                                bases_per_line = 0;
+                                bytes_per_line = 0;
+
                                 seq_read_offset = try self.stream.seekableStream().getPos();
-                                count_seq += 1;
                                 try self.stage.append(byte);
                                 seq_len += 1;
                                 break :l .seq;
@@ -176,11 +186,17 @@ pub fn FqReader(comptime Stream: type) type {
                             error.EndOfStream => return null, // we just have a name so the buffer is malformed
                             else => |e| return e,
                         };
+                        bytes_per_line += 1;
                         state = switch (byte) {
                             '\r' => state,
-                            '\n' => .seq_start,
+                            '\n' => l: {
+                                seq_num_lines += 1;
+                                if (expected_bases_per_line == null) expected_bases_per_line = bases_per_line;
+                                if (expected_bytes_per_line == null) expected_bytes_per_line = bytes_per_line;
+                                break :l .seq_start;
+                            },
                             else => l: {
-                                count_seq += 1;
+                                bases_per_line += 1;
                                 try self.stage.append(byte);
                                 seq_len += 1;
                                 break :l state;
@@ -195,31 +211,29 @@ pub fn FqReader(comptime Stream: type) type {
                         state = switch (byte) {
                             '\r' => .qual,
                             '\n' => l: {
+                                if (state == .qual) qual_num_lines += 1;
                                 // '@' and '+' can show up in qualifiers
                                 //   the number of sequence characters has to equal qualifiers
-                                if (count_qul == count_seq)
-                                    break :finished;
-                                if (count_qul > count_seq)
-                                    return error.MismatchedQualAndSeq;
+                                if (qual_len == seq_len) break :finished;
+                                if (qual_len > seq_len) return error.QualAndSeqMismatch;
                                 break :l .qual;
                             },
                             else => l: {
-                                count_qul += 1;
-                                if (state == .qual_start) {
-                                    qual_read_offset = try self.stream.seekableStream().getPos();
-                                }
-                                //try qual_writer.writeByte(byte);
-                                //if (!comptime options.skipQual) {
-                                    try self.stage.append(byte);
-                                    qual_len += 1;
-                                //}
+                                if (state == .qual_start) qual_read_offset = try self.stream.seekableStream().getPos();
+
+                                try self.stage.append(byte);
+                                qual_len += 1;
                                 break :l .qual;
                             },
                         };
                     },
                 }
             }
-            return .{ .seq_offset = seq_read_offset, .qual_offset = qual_read_offset, .sequence_len = count_seq, .entry = .{ .name = self.stage.items[0..name_len], .seq = self.stage.items[name_len .. name_len + seq_len], .qual = self.stage.items[name_len + seq_len .. qual_len + seq_len + name_len] } };
+
+            if (qual_num_lines != seq_num_lines)
+                return error.QualAndSeqLineMismatch;
+
+            return .{ .seq_offset = seq_read_offset, .qual_offset = qual_read_offset, .sequence_len = seq_len, .entry = .{ .name = self.stage.items[0..name_len], .seq = self.stage.items[name_len .. name_len + seq_len], .qual = self.stage.items[name_len + seq_len .. qual_len + seq_len + name_len] } };
         }
     };
 }
@@ -234,22 +248,12 @@ test "parse fai index and seek fq" {
     var fqStream = std.io.fixedBufferStream(fq);
     var fqReadIter = seq.fq.fqReader(std.testing.allocator, fqStream);
     defer fqReadIter.deinit();
-    const TestCase = struct { 
-        index: seq.fai.FaiEntry(.fastq, .{}), 
-        seq: []const u8,
-        qual: []const u8
-    };
+    const TestCase = struct { index: seq.fai.FaiEntry(.fastq, .{}), seq: []const u8, qual: []const u8 };
 
     const test_cases =
         [_]TestCase{
-        .{ .index = .{ .name = "FAKE0005_1", .length = 63, .offset = 85, .line_base = 63, .line_width = 64, .qual_offset = 151 }, 
-            .seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACG", 
-            .qual = "@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
-        },
-        .{ .index = .{ .name = "FAKE0006_4", .length = 63, .offset = 1590, .line_base = 63, .line_width = 64, .qual_offset = 1656 }, 
-            .seq = "GCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA",
-           .qual = "~}|{zyxwvutsrqponmlkjihgfedcba`_^]\\[ZYXWVUTSRQPONMLKJIHGFEDCBA@" 
-        },
+        .{ .index = .{ .name = "FAKE0005_1", .length = 63, .offset = 85, .line_base = 63, .line_width = 64, .qual_offset = 151 }, .seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACG", .qual = "@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~" },
+        .{ .index = .{ .name = "FAKE0006_4", .length = 63, .offset = 1590, .line_base = 63, .line_width = 64, .qual_offset = 1656 }, .seq = "GCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA", .qual = "~}|{zyxwvutsrqponmlkjihgfedcba`_^]\\[ZYXWVUTSRQPONMLKJIHGFEDCBA@" },
     };
 
     for (test_cases) |case| {
