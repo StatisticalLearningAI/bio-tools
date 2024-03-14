@@ -8,18 +8,20 @@ pub const FqEntry = struct {
     seq: []const u8,
 };
 
-pub const FqWriteOption = struct { 
-    repeatNameForQual: bool = false, 
+pub const FqWriteOption = struct {
+    repeatNameForQual: bool = false,
 };
 
-pub fn FqWriter(comptime Stream: type, comptime options: FqWriteOption) type {
-
+pub fn FqWriter(comptime Stream: type) type {
     return struct {
         const Self = @This();
+
         stream: *Stream,
+        options: FqWriteOption,
         pub const WriterError = Stream.Writer.Error;
+
         pub fn write_record(self: *Self, slice: seq.fq.FqEntry) Stream.Writer.Error!void {
-            var fq = if(@hasField(Stream, "fq")) self.stream.fq.writer() else self.stream.writer();
+            var fq = self.stream.writer();
 
             try fq.writeByte('@');
             try fq.writeAll(slice.name);
@@ -29,7 +31,7 @@ pub fn FqWriter(comptime Stream: type, comptime options: FqWriteOption) type {
             try fq.writeByte('\n');
 
             try fq.writeByte('+');
-            if (options.repeatNameForQual) {
+            if (self.options.repeatNameForQual) {
                 try fq.writeAll(slice.name);
             }
             try fq.writeByte('\n');
@@ -40,42 +42,75 @@ pub fn FqWriter(comptime Stream: type, comptime options: FqWriteOption) type {
     };
 }
 
-pub fn fqWriter( stream: anytype, comptime option: FqWriteOption) FqWriter(@TypeOf(stream.*), option) {
-    return .{ 
-        .stream = stream, 
+pub fn fqWriter(stream: anytype, option: FqWriteOption) FqWriter(@TypeOf(stream.*)) {
+    return .{
+        .options = option,
+        .stream = stream,
     };
 }
 
-
-pub const FqReaderOption = struct {
-    skipQual: bool = false, // skip qualifiers 
-    //lineCountOfQualAndSeqMatch: bool = false, // ensure the number of lines matches for qual and seq
-};
-
-pub fn FqReader(comptime Stream: type, comptime options: FqReaderOption) type {
+pub fn FqReader(comptime Stream: type) type {
     return struct {
         stream: Stream,
-        stage: std.ArrayList(u8),  
+        stage: std.ArrayList(u8),
         const Self = @This();
 
         pub const Container = seq.SeqContianer.fastq;
-
         pub const FqIterator = struct {
             seq_offset: usize, // offset in the reader
             sequence_len: usize, // the number of bases in the sequence
             qual_offset: u64,
-            entry: seq.fq.FqEntry
-        }; 
+            //fai: seq.fai.FaiEntry(.fastq, .{}),
+            entry: seq.fq.FqEntry,
+        };
 
         pub fn deinit(self: *Self) void {
             self.stage.deinit();
         }
 
+        // optional parameters for readining index
+        pub const ReadUsingIndexOptions = struct {
+           skip_qual: bool = false
+        };
         // seek to the record using FaiEntry
-        pub fn readUsingFai(self: *Self, fai: anytype) (Stream.SeekableStream.Error)!void{
-            _ = fai;
+        pub fn readUsingIndex(self: *Self, fai: anytype, comptime options: ReadUsingIndexOptions) (Stream.SeekError || error{OutOfMemory, EndOfStream})!seq.fq.FqEntry {
+            self.stage.shrinkRetainingCapacity(0);
             var seek = self.stream.seekableStream();
-            _ = seek;
+            var reader = self.stream.reader();
+            
+            {
+                try seek.seekTo(fai.offset); // seek to the offset of the fai
+                var remaining_bases: usize = fai.length;
+                while (remaining_bases > 0) {
+                    const bases_to_read = @min(fai.line_base, remaining_bases);
+                    try self.stage.ensureTotalCapacity(self.stage.items.len + bases_to_read);
+                    const bases_read = try reader.read(self.stage.unusedCapacitySlice()[0..bases_to_read]);
+                    if (bases_read < bases_to_read)
+                        return error.EndOfStream;
+                    self.stage.items.len += bases_read;
+                    remaining_bases -= bases_read;
+                    try reader.skipBytes(fai.line_width - fai.line_base, .{.buf_size = 16});
+                }
+            }
+            if(!options.skip_qual) {
+                try seek.seekTo(fai.qual_offset); // seek to the offset of the fai
+                var remaining_qual: usize = fai.length;
+                while (remaining_qual > 0) {
+                    const bases_to_read = @min(fai.line_base, remaining_qual);
+                    try self.stage.ensureTotalCapacity(self.stage.items.len + bases_to_read);
+                    const bases_read = try reader.read(self.stage.unusedCapacitySlice()[0..bases_to_read]);
+                    if (bases_read < bases_to_read)
+                        return error.EndOfStream;
+                    self.stage.items.len += bases_read;
+                    remaining_qual -= bases_read;
+                    try reader.skipBytes(fai.line_width - fai.line_base, .{.buf_size = 16});
+                }
+            }
+            return .{
+                .name = fai.name,
+                .seq = self.stage.items[0..fai.length],
+                .qual = if(options.skip_qual) .{} else self.stage.items[fai.length..fai.length + fai.length],
+            };
         }
 
         pub fn next(self: *Self) (Stream.Reader.Error || error{ OutOfMemory, MismatchedQualAndSeq, MalformedIdentifier })!?FqIterator {
@@ -88,10 +123,10 @@ pub fn FqReader(comptime Stream: type, comptime options: FqReaderOption) type {
             var count_seq: u32 = 0;
             var count_qul: u32 = 0;
             var state: enum { start, name, seq, seq_start, qual, qual_start } = .start;
-            
+
             var name_len: usize = 0;
-            var seq_len: usize  = 0;
-            var qual_len: usize  = 0;
+            var seq_len: usize = 0;
+            var qual_len: usize = 0;
 
             finished: while (true) {
                 switch (state) {
@@ -170,45 +205,64 @@ pub fn FqReader(comptime Stream: type, comptime options: FqReaderOption) type {
                             },
                             else => l: {
                                 count_qul += 1;
-                                if(state == .qual_start) {
-                                    qual_read_offset = try self.stream.seekableStream().getPos(); 
+                                if (state == .qual_start) {
+                                    qual_read_offset = try self.stream.seekableStream().getPos();
                                 }
                                 //try qual_writer.writeByte(byte);
-                                if (!comptime options.skipQual) {
+                                //if (!comptime options.skipQual) {
                                     try self.stage.append(byte);
-                                    qual_len += 1; 
-                                }
+                                    qual_len += 1;
+                                //}
                                 break :l .qual;
                             },
                         };
                     },
                 }
             }
-            return .{ 
-                .seq_offset = seq_read_offset, 
-                .qual_offset = qual_read_offset,
-                .sequence_len = count_seq, 
-                .entry = .{
-                    .name = self.stage.items[0..name_len],
-                    .seq = self.stage.items[name_len..name_len + seq_len],
-                    .qual = self.stage.items[name_len + seq_len..qual_len + seq_len + name_len]
-                }
-            };
+            return .{ .seq_offset = seq_read_offset, .qual_offset = qual_read_offset, .sequence_len = count_seq, .entry = .{ .name = self.stage.items[0..name_len], .seq = self.stage.items[name_len .. name_len + seq_len], .qual = self.stage.items[name_len + seq_len .. qual_len + seq_len + name_len] } };
         }
     };
 }
 
-pub fn fqReader(allocator: std.mem.Allocator ,stream: anytype, comptime option: FqReaderOption) FqReader(@TypeOf(stream), option) {
-    return .{
-        .stream = stream,
-        .stage = std.ArrayList(u8).init(allocator)
-    };
+pub fn fqReader(allocator: std.mem.Allocator, stream: anytype) FqReader(@TypeOf(stream)) {
+    return .{ .stream = stream, .stage = std.ArrayList(u8).init(allocator) };
 }
 
-test "test read fq records" {
+test "parse fai index and seek fq" {
+    //const indexFile = @embedFile("./test/t3.fq.fai");
+    const fq = @embedFile("./test/t3.fq");
+    var fqStream = std.io.fixedBufferStream(fq);
+    var fqReadIter = seq.fq.fqReader(std.testing.allocator, fqStream);
+    defer fqReadIter.deinit();
+    const TestCase = struct { 
+        index: seq.fai.FaiEntry(.fastq, .{}), 
+        seq: []const u8,
+        qual: []const u8
+    };
+
+    const test_cases =
+        [_]TestCase{
+        .{ .index = .{ .name = "FAKE0005_1", .length = 63, .offset = 85, .line_base = 63, .line_width = 64, .qual_offset = 151 }, 
+            .seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACG", 
+            .qual = "@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+        },
+        .{ .index = .{ .name = "FAKE0006_4", .length = 63, .offset = 1590, .line_base = 63, .line_width = 64, .qual_offset = 1656 }, 
+            .seq = "GCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA",
+           .qual = "~}|{zyxwvutsrqponmlkjihgfedcba`_^]\\[ZYXWVUTSRQPONMLKJIHGFEDCBA@" 
+        },
+    };
+
+    for (test_cases) |case| {
+        const record = try fqReadIter.readUsingIndex(case.index, .{});
+        try testing.expectEqualStrings(case.seq, record.seq);
+        try testing.expectEqualStrings(case.qual, record.qual);
+    }
+}
+
+test "read fq records t1.fq" {
     const file = @embedFile("./test/t1.fq");
     var stream = std.io.fixedBufferStream(file);
-    var fqReadIter = seq.fq.fqReader(std.testing.allocator,stream, .{});
+    var fqReadIter = seq.fq.fqReader(std.testing.allocator, stream);
     defer fqReadIter.deinit();
     if (try fqReadIter.next()) |result| {
         try testing.expectEqualStrings("HWI-D00523:240:HF3WGBCXX:1:1101:2574:2226 1:N:0:CTGTAG", result.entry.name);
@@ -224,7 +278,7 @@ test "test read fq records" {
     } else try testing.expect(false);
 }
 
-test "fq writer test" {
+test "writing fq to buffer" {
     var buf = std.ArrayList(u8).init(std.testing.allocator);
     defer buf.deinit();
     var writer = seq.fq.fqWriter(&buf, .{});

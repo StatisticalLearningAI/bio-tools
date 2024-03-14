@@ -4,32 +4,43 @@ const testing = std.testing;
 
 const ColumnIdx = enum(u8) { name = 0, length = 1, offset = 2, line_bases = 3, line_width = 4, qual_offset = 5 };
 
-//faidx – an index enabling random access to FASTA and FASTQ files
+
+pub const FaiEntryOptions = struct {
+    name_reserve_len: usize = 0, // values > 0 will be a have a reserved len with a terminated 0 
+};
+
+// http://www.htslib.org/doc/faidx.html
+// faidx – an index enabling random access to FASTA and FASTQ files
 // if the reserved is 0 then we assume its a const []u8 else the entry takes up some amount of reserved memory
-pub fn FaiEntry(comptime container: seq.SeqContianer, comptime reserved_len: usize) type {
+pub fn FaiEntry(comptime container: seq.SeqContianer, comptime options: FaiEntryOptions) type {
     return switch (container) {
         .fastq => struct {
             pub const number_of_col = 6;
-
-            name: if (reserved_len == 0) []const u8 else [reserved_len:0]u8,
-            length: u32,
-            offset: u64,
-            line_base: u32,
-            line_width: u32,
-            qual_offset: u64,
+            name: switch(options.name_reserve_len) {
+                0 => []const u8, //	Name of this reference sequence
+                else => |value| [value:0]u8
+            },
+            length: u32,      // Total length of this reference sequence, in bases
+            offset: u64,      // Offset in the FASTA/FASTQ file of this sequence's first base
+            line_base: u32,   // The number of bases on each line
+            line_width: u32,  // The number of bytes in each line, including the newline
+            qual_offset: u64, // Offset of sequence's first quality within the FASTQ file
         },
         .fasta => struct {
-            pub const number_of_col= 5;
-
-            name: if (reserved_len == 0) []const u8 else [reserved_len:0]u8,
-            length: u32,
-            offset: u64,
-            line_base: u32,
-            line_width: u32,
+            pub const number_of_col = 5;
+            name: switch(options.name_reserve_len) {
+                0 => []const u8, //	Name of this reference sequence
+                else => |value| [value:0]u8
+            },
+            length: u32,     // Total length of this reference sequence, in bases 
+            offset: u64,     // Offset in the FASTA/FASTQ file of this sequence's first base 
+            line_base: u32,  // The number of bases on each line 
+            line_width: u32, // The number of bytes in each line, including the newline 
         },
         else => @compileError("Unsupported format: " ++ seq.SeqContianer.name(container)),
     };
 }
+
 
 pub fn FaiTaggedEntry(comptime reserve_len: usize) type {
     return union(seq.SeqContianer) { fastq: FaiEntry(.fastq, reserve_len), fasta: FaiEntry(.fasta, reserve_len) };
@@ -47,7 +58,7 @@ pub fn FaiReader(comptime Stream: type, comptime option: FaiReaderOption) type {
         // |  name | .. parsing .. |
         stage: std.BoundedArray(u8, option.bufferReserver),
 
-        pub const Iterable = FaiEntry(option.container, 0);
+        pub const Iterable = FaiEntry(option.container, .{});
 
         const Self = @This();
         pub fn  next(self: *Self)  (error{ UnexpectedNumberColum, Overflow, ParseError})!?Iterable  {
@@ -139,7 +150,7 @@ test "fastq parse fai index" {
     var stream = std.io.fixedBufferStream(file);
     var reader = faiReader(stream, .{ .container = seq.SeqContianer.fastq });
     const test_cases = 
-        [_]FaiEntry(seq.SeqContianer.fastq, 0){
+        [_]FaiEntry(seq.SeqContianer.fastq, .{}){
         .{.name = "FAKE0005_1", .length=63, .offset=85, .line_base=63, .line_width=64, .qual_offset=151},
         .{.name = "FAKE0006_1", .length=63, .offset=300, .line_base=63, .line_width=64, .qual_offset=366},
         .{.name = "FAKE0005_2", .length=63, .offset=515, .line_base=63, .line_width=64, .qual_offset=581},
@@ -167,7 +178,7 @@ test "fasta parse fai index" {
     var reader = faiReader(stream, .{ .container = seq.SeqContianer.fasta });
 
     const test_cases = 
-        [_]FaiEntry(seq.SeqContianer.fasta, 0){
+        [_]FaiEntry(seq.SeqContianer.fasta, .{}){
         .{.name = "CHROMOSOME_I", .length=1009800, .offset=14, .line_base=50, .line_width = 51 },
         .{.name = "CHROMOSOME_II", .length=5000, .offset=1030025, .line_base=50, .line_width = 51 },
         .{.name = "CHROMOSOME_III", .length=5000, .offset=1035141, .line_base=50, .line_width = 51 },
@@ -186,5 +197,5 @@ test "fasta parse fai index" {
             try testing.expectEqual(@as(u32, case.line_width), result.line_width);
         } else try testing.expect(false);
     }
-    try testing.expectEqual(@as(?FaiEntry(seq.SeqContianer.fasta,0), null), try reader.next()); // we ran out of records
+    try testing.expectEqual(@as(?FaiEntry(seq.SeqContianer.fasta, .{}), null), try reader.next()); // we ran out of records
 }
