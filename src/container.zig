@@ -1,4 +1,5 @@
 pub const SeqContianer = enum {
+    unknown,
     fastq, //  text-based format for nucleotide sequences 
     fasta,
     bam,
