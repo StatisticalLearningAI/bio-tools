@@ -67,57 +67,65 @@ pub fn Writer(
 
 pub const FaRecord = struct {
     const Self = @This();
-    buf: std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    
+    name: std.ArrayListUnmanaged(u8),
+    qual: std.ArrayListUnmanaged(u8),
+    seq: std.ArrayListUnmanaged(u8),
+
     format: seq.SeqContianer = .unknown,
-    name_len: usize = 0,
-    qual_len: usize = 0,
-    seq_len: usize = 0,
+
 
     pub const FastaWriter = seq.fa.Writer(*Self, consumerHandler);
+    pub fn init(allocator: std.mem.Allocator ) Self {
+        return .{
+            .allocator = allocator,
+            .name = .{},
+            .qual = .{},
+            .seq = .{},
+        };
+    }
 
     pub fn deinit(self: *FaRecord) void {
-        self.buf.deinit();
+        self.name.deinit(self.allocator);
+        self.seq.deinit(self.allocator);
+        self.qual.deinit(self.allocator);
     }
 
     pub fn fastaWriter(self: *Self) FastaWriter { 
         return .{ .context = self };
     }
 
-    fn consumerHandler(self: *Self, chunk: Section) anyerror!void {
-        switch (chunk) {
+    fn faConsumeName(self: *Self, format: seq.SeqContianer, buf: []const u8) anyerror!void { 
+        try self.name.appendSlice(self.allocator,buf);
+        self.format = format;
+    }
+    fn faConsumeQual(self: *Self, buf: []const u8) anyerror!void {
+        try self.qual.appendSlice(self.allocator,buf);
+    }
+    fn faConsumeSeq(self: *Self, buf: []const u8) anyerror!void { 
+        try self.seq.appendSlice(self.allocator,buf);
+    }
+
+    fn consumerHandler(self: *Self, section: Section) anyerror!void {
+        switch (section) {
             .name => |c| {
-                try self.buf.appendSlice(c.data);
-                self.name_len += c.data.len;
+                try self.name.appendSlice(self.allocator,c.data);
                 self.format = c.format;
             },
             .qual => |c| {
-                try self.buf.appendSlice(c.chunk);
-                self.qual_len += c.chunk.len;
+                try self.qual.appendSlice(self.allocator,c.chunk);
             },
             .seq => |c| {
-                try self.buf.appendSlice(c.chunk);
-                self.seq_len += c.chunk.len;
+                try self.seq.appendSlice(self.allocator,c.chunk);
             },
         }
     }
 
-    fn name(self: *Self) []const u8 {
-        return self.buf.items[0..self.name_len]; 
-    }
-    
-    fn sequence(self: *Self) []const u8 {
-        return self.buf.items[self.name_len .. self.name_len + self.seq_len];
-    }
-
-    fn quality(self: *Self) []const u8 {
-        return self.buf.items[self.name_len + self.seq_len .. self.qual_len + self.seq_len + self.name_len]; 
-    }
-
     fn reset(self: *Self) void {
-        self.buf.shrinkRetainingCapacity(0);
-        self.name_len = 0;
-        self.seq_len = 0;
-        self.qual_len = 0;
+        self.name.shrinkRetainingCapacity(0);
+        self.qual.shrinkRetainingCapacity(0);
+        self.seq.shrinkRetainingCapacity(0);
     }
 };
 
@@ -134,7 +142,7 @@ pub fn FaReadIterator(comptime Stream: type) type {
             reserve_len: u32 = 2048
             
         };
-        pub fn next(self: *Self, consumer: anytype, comptime option: Option) (anyerror || error{BufferOverflow})!bool {
+        pub fn next(self: *Self, record: anytype, comptime option: Option) (anyerror || error{BufferOverflow})!bool {
             var stage_buffer: [option.reserve_len]u8 = undefined;
             var stage = std.io.fixedBufferStream(stage_buffer[0..]);
 
@@ -176,7 +184,11 @@ pub fn FaReadIterator(comptime Stream: type) type {
                             error.EndOfStream => return false,
                             else => |e| return e,
                         };
-                        try consumer.write(.{ .name = .{ .format = self.format, .data = std.mem.trim(u8, stage.getWritten(), &std.ascii.whitespace) } });
+                        //if(comptime @hasDecl(@TypeOf(record.*), "faConsumeName")) {
+                            try record.faConsumeName(self.format, std.mem.trim(u8, stage.getWritten(), &std.ascii.whitespace));
+
+                        //} 
+
                         stage.reset();
                         self.state = .seq;
                     },
@@ -231,7 +243,7 @@ pub fn FaReadIterator(comptime Stream: type) type {
                                 bytes_per_line += byte_buf.len;
                                 bases_per_line += bases_buf.len;
 
-                                try consumer.write(.{ .seq = .{ .line = seq_line_count, .chunk = bases_buf } });
+                                try record.faConsumeSeq(bases_buf);
                                 
                                 seq_number_bases += bases_buf.len;
                                 stage.reset();
@@ -270,7 +282,8 @@ pub fn FaReadIterator(comptime Stream: type) type {
                             bytes_per_line += byte_buf.len;
                             bases_per_line += qual_buf.len;
 
-                            try consumer.write(.{ .qual = .{ .line = qual_line_count, .chunk = qual_buf } });
+                            try record.faConsumeQual(qual_buf);
+                            //try record.write(.{ .qual = .{ .line = qual_line_count, .chunk = qual_buf } });
                             qual_number_bases += qual_buf.len;
                             stage.reset();
                             break :same_line_chunk;
@@ -563,13 +576,13 @@ test "read fq records t1.fq" {
         }
     };
 
-    var record: FaRecord = .{ .buf = std.ArrayList(u8).init(std.testing.allocator) };
+    var record: FaRecord = FaRecord.init(std.testing.allocator);
     defer record.deinit();
     for (test_cases) |case| {
-        if(try iter.next(record.fastaWriter(), .{})) {
-            try testing.expectEqualStrings(case.name, record.name());
-            try testing.expectEqualStrings(case.sequence, record.sequence());
-            try testing.expectEqualStrings(case.quality, record.quality());
+        if(try iter.next(&record, .{})) {
+            try testing.expectEqualStrings(case.name, record.name.items);
+            try testing.expectEqualStrings(case.sequence, record.seq.items);
+            try testing.expectEqualStrings(case.quality, record.qual.items);
         } else try testing.expect(false);
         record.reset();
     }
