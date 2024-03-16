@@ -44,107 +44,37 @@ pub fn fqWriter(stream: anytype, option: FqWriteOption) FqWriter(@TypeOf(stream.
     };
 }
 
-pub const SectionType = enum { name, qual, seq };
-// these are read in order with fastq
-pub const Section = union(SectionType) {
-    name: struct { format: seq.SeqContianer, data: []const u8 },
-    qual: struct { line: u32, chunk: []const u8 },
-    seq: struct { line: u32, chunk: []const u8 },
-};
-
-pub fn Writer(
-    comptime Context: type,
-    comptime writeFn: fn (context: Context, chunk: Section) anyerror!void,
-) type {
+pub fn Consumer(comptime Context: type, comptime StreamError: type, comptime fnWriteName: fn (self: Context, buf: []const u8) StreamError!void, comptime fnWriteSeq: fn (self: Context, buf: []const u8) StreamError!void, comptime fnWriteQual: fn (self: Context, buf: []const u8) StreamError!void) type {
     return struct {
-        const Self = @This();
         context: Context,
-        pub fn write(self: Self, chunk: Section) anyerror!void {
-            try writeFn(self.context, chunk);
+        pub const Self = @This();
+        pub const Error = StreamError;
+        inline fn writeName(self: Self, buf: []const u8) StreamError!void {
+            try fnWriteName(self.context, buf);
+        }
+        inline fn writeSeq(self: Self, buf: []const u8) StreamError!void {
+            try fnWriteSeq(self.context, buf);
+        }
+        inline fn writeQual(self: Self, buf: []const u8) StreamError!void {
+            try fnWriteQual(self.context, buf);
         }
     };
 }
-
-pub const FaRecord = struct {
-    const Self = @This();
-    allocator: std.mem.Allocator,
-    
-    name: std.ArrayListUnmanaged(u8),
-    qual: std.ArrayListUnmanaged(u8),
-    seq: std.ArrayListUnmanaged(u8),
-
-    format: seq.SeqContianer = .unknown,
-
-
-    pub const FastaWriter = seq.fa.Writer(*Self, consumerHandler);
-    pub fn init(allocator: std.mem.Allocator ) Self {
-        return .{
-            .allocator = allocator,
-            .name = .{},
-            .qual = .{},
-            .seq = .{},
-        };
-    }
-
-    pub fn deinit(self: *FaRecord) void {
-        self.name.deinit(self.allocator);
-        self.seq.deinit(self.allocator);
-        self.qual.deinit(self.allocator);
-    }
-
-    pub fn fastaWriter(self: *Self) FastaWriter { 
-        return .{ .context = self };
-    }
-
-    fn faConsumeName(self: *Self, format: seq.SeqContianer, buf: []const u8) anyerror!void { 
-        try self.name.appendSlice(self.allocator,buf);
-        self.format = format;
-    }
-    fn faConsumeQual(self: *Self, buf: []const u8) anyerror!void {
-        try self.qual.appendSlice(self.allocator,buf);
-    }
-    fn faConsumeSeq(self: *Self, buf: []const u8) anyerror!void { 
-        try self.seq.appendSlice(self.allocator,buf);
-    }
-
-    fn consumerHandler(self: *Self, section: Section) anyerror!void {
-        switch (section) {
-            .name => |c| {
-                try self.name.appendSlice(self.allocator,c.data);
-                self.format = c.format;
-            },
-            .qual => |c| {
-                try self.qual.appendSlice(self.allocator,c.chunk);
-            },
-            .seq => |c| {
-                try self.seq.appendSlice(self.allocator,c.chunk);
-            },
-        }
-    }
-
-    fn reset(self: *Self) void {
-        self.name.shrinkRetainingCapacity(0);
-        self.qual.shrinkRetainingCapacity(0);
-        self.seq.shrinkRetainingCapacity(0);
-    }
+pub const FaReadIterOptions = struct {
+    reserve_len: usize = 4096,
 };
 
-pub fn FaReadIterator(comptime Stream: type) type {
+pub fn FaReadIterator(comptime Stream: type, comptime options: FaReadIterOptions) type {
     return struct {
         const Self = @This();
 
         stream: Stream,
-        
+        buffer: [options.reserve_len]u8 = undefined,
         state: enum { start, name, seq, qual } = .start,
         format: seq.SeqContianer = .fastq,
 
-        pub const Option = struct { 
-            reserve_len: u32 = 2048
-            
-        };
-        pub fn next(self: *Self, record: anytype, comptime option: Option) (anyerror || error{BufferOverflow})!bool {
-            var stage_buffer: [option.reserve_len]u8 = undefined;
-            var stage = std.io.fixedBufferStream(stage_buffer[0..]);
+        pub fn next(self: *Self, consumer: anytype) (@TypeOf(consumer).Error || Stream.ReadError || error{ BufferOverflow, RecordParseError })!bool {
+            var stage = std.io.fixedBufferStream(&self.buffer);
 
             var reader = self.stream.reader();
 
@@ -155,8 +85,8 @@ pub fn FaReadIterator(comptime Stream: type) type {
             var qual_number_bases: usize = 0;
 
             var bytes_per_line: usize = 0;
-            var bytes_per_line_expected: ?usize  = null;
-            
+            var bytes_per_line_expected: ?usize = null;
+
             var bases_per_line: usize = 0;
             var bases_per_line_expected: ?usize = null;
 
@@ -180,55 +110,58 @@ pub fn FaReadIterator(comptime Stream: type) type {
                         };
                     },
                     .name => {
-                        reader.streamUntilDelimiter(stage.writer(), '\n', option.reserve_len) catch |err| switch (err) {
+                        reader.streamUntilDelimiter(stage.writer(), '\n', options.reserve_len) catch |err| switch (err) {
                             error.EndOfStream => return false,
+                            error.StreamTooLong => return error.BufferOverflow,
+                            error.NoSpaceLeft => unreachable,
                             else => |e| return e,
                         };
-                        //if(comptime @hasDecl(@TypeOf(record.*), "faConsumeName")) {
-                            try record.faConsumeName(self.format, std.mem.trim(u8, stage.getWritten(), &std.ascii.whitespace));
-
-                        //} 
+                        try consumer.writeName(std.mem.trim(u8, stage.getWritten(), &std.ascii.whitespace));
 
                         stage.reset();
                         self.state = .seq;
                     },
                     .seq => blk: {
                         while (true) {
-                            switch (try reader.readByte()) {
+                            switch (reader.readByte() catch |err| switch (err) {
+                                error.EndOfStream => return false,
+                            }) {
                                 '+' => {
                                     self.state = .qual;
                                     try reader.skipUntilDelimiterOrEof('\n');
-                                    bases_per_line = 0; 
+                                    bases_per_line = 0;
                                     bytes_per_line = 0;
                                     break :blk;
                                 },
                                 '>' => {
                                     if (self.format == .fastq)
-                                        return error.ParseError;
+                                        return error.RecordParseError;
                                     self.state = .name; // return back to the name state
                                     return true;
                                 },
                                 else => |b| {
-                                    if(seq_line_count > 0) {
+                                    if (seq_line_count > 0) {
                                         // we're onto the next line need to check line_counts
-                                        if(bytes_per_line_expected) |count| {
-                                            if(bytes_per_line != count) return error.RecordParseError;
+                                        if (bytes_per_line_expected) |count| {
+                                            if (bytes_per_line != count) return error.RecordParseError;
                                         } else bytes_per_line_expected = bytes_per_line;
-                                        if(bases_per_line_expected) |count| {
-                                            if(bases_per_line != count) return error.RecordParseError;
+                                        if (bases_per_line_expected) |count| {
+                                            if (bases_per_line != count) return error.RecordParseError;
                                         } else bases_per_line_expected = bases_per_line;
                                     }
-                                        
-                                    bases_per_line = 0; 
+
+                                    bases_per_line = 0;
                                     bytes_per_line = 0;
 
                                     const app: [1]u8 = .{b};
-                                    _ = try stage.write(&app);
+                                    _ = stage.write(&app) catch |err| switch (err) {
+                                        error.NoSpaceLeft => unreachable,
+                                    };
                                 },
                             }
-                            same_line_chunk: while(true)  {
+                            same_line_chunk: while (true) {
                                 seq_line_count += 1;
-                                reader.streamUntilDelimiter(stage.writer(), '\n', option.reserve_len) catch |err| switch (err) {
+                                reader.streamUntilDelimiter(stage.writer(), '\n', options.reserve_len) catch |err| switch (err) {
                                     error.EndOfStream => return false,
                                     error.StreamTooLong => {
                                         seq_line_count -= 1;
@@ -239,12 +172,12 @@ pub fn FaReadIterator(comptime Stream: type) type {
                                 };
                                 const byte_buf = stage.getWritten();
                                 const bases_buf = std.mem.trim(u8, byte_buf, &std.ascii.whitespace);
-                              
+
                                 bytes_per_line += byte_buf.len;
                                 bases_per_line += bases_buf.len;
 
-                                try record.faConsumeSeq(bases_buf);
-                                
+                                try consumer.writeSeq(bases_buf);
+
                                 seq_number_bases += bases_buf.len;
                                 stage.reset();
                                 break :same_line_chunk;
@@ -252,22 +185,21 @@ pub fn FaReadIterator(comptime Stream: type) type {
                         }
                     },
                     .qual => {
-
-                        if(qual_line_count > 0) {
-                            if(bytes_per_line_expected) |count| {
-                                if(bytes_per_line != count) return error.RecordParseError;
+                        if (qual_line_count > 0) {
+                            if (bytes_per_line_expected) |count| {
+                                if (bytes_per_line != count) return error.RecordParseError;
                             } else return error.RecordParseError;
-                            if(bases_per_line_expected) |count| {
-                                if(bases_per_line != count) return error.RecordParseError;
-                            } else return error.RecordParseError; 
-                            
-                            bases_per_line = 0; 
+                            if (bases_per_line_expected) |count| {
+                                if (bases_per_line != count) return error.RecordParseError;
+                            } else return error.RecordParseError;
+
+                            bases_per_line = 0;
                             bytes_per_line = 0;
                         }
 
-                        same_line_chunk: while(true)  {
+                        same_line_chunk: while (true) {
                             qual_line_count += 1;
-                            reader.streamUntilDelimiter(stage.writer(), '\n', option.reserve_len) catch |err| switch (err) {
+                            reader.streamUntilDelimiter(stage.writer(), '\n', options.reserve_len) catch |err| switch (err) {
                                 error.EndOfStream => return false,
                                 error.StreamTooLong => {
                                     qual_line_count -= 1;
@@ -278,19 +210,18 @@ pub fn FaReadIterator(comptime Stream: type) type {
                             };
                             const byte_buf = stage.getWritten();
                             const qual_buf = std.mem.trim(u8, byte_buf, &std.ascii.whitespace);
-                            
+
                             bytes_per_line += byte_buf.len;
                             bases_per_line += qual_buf.len;
 
-                            try record.faConsumeQual(qual_buf);
-                            //try record.write(.{ .qual = .{ .line = qual_line_count, .chunk = qual_buf } });
+                            try consumer.writeQual(qual_buf);
                             qual_number_bases += qual_buf.len;
                             stage.reset();
                             break :same_line_chunk;
                         }
-                       
-                        if (qual_number_bases == seq_number_bases) { 
-                            if(seq_line_count != qual_line_count) return error.RecordParseError; 
+
+                        if (qual_number_bases == seq_number_bases) {
+                            if (seq_line_count != qual_line_count) return error.RecordParseError;
                             self.state = .start;
                             return true;
                         } else if (qual_number_bases > seq_number_bases) {
@@ -304,224 +235,16 @@ pub fn FaReadIterator(comptime Stream: type) type {
     };
 }
 
-pub fn fastaReadIterator( stream: anytype) FaReadIterator(@TypeOf(stream)) {
+pub fn fastaReadUsingIndex(comptime container: seq.SeqContianer, stream: anytype, record: anytype, index: seq.fai.FastaIndex) !bool {
+    _ = index;
+    _ = record;
+    _ = stream;
+    _ = container;
+    return true;
+}
+
+pub fn fastaReadIterator(stream: anytype, comptime options: FaReadIterOptions) FaReadIterator(@TypeOf(stream), options) {
     return .{ .stream = stream };
-}
-//pub fn readUsingIndex(self: *Self, index: anytype) void {
-//
-//
-//}
-
-pub fn FqReader(comptime Stream: type) type {
-    return struct {
-        stream: Stream,
-        stage: std.ArrayList(u8),
-        const Self = @This();
-
-        pub const ParseErrors = error{RecordParseError};
-        pub const Container = seq.SeqContianer.fastq;
-
-        pub fn deinit(self: *Self) void {
-            self.stage.deinit();
-        }
-
-        // optional parameters for readining index
-        pub const ReadUsingIndexOptions = struct { skip_qual: bool = false };
-        // seek to the record using FaiEntry
-        pub fn readUsingIndex(self: *Self, fai: anytype, comptime options: ReadUsingIndexOptions) (Stream.SeekError || error{ OutOfMemory, EndOfStream })!struct {
-            name: []const u8,
-            qual: []const u8,
-            seq: []const u8,
-        } {
-            self.stage.shrinkRetainingCapacity(0);
-            var seek = self.stream.seekableStream();
-            var reader = self.stream.reader();
-
-            {
-                try seek.seekTo(fai.offset); // seek to the offset of the fai
-                var remaining_bases: usize = fai.length;
-                while (remaining_bases > 0) {
-                    const bases_to_read = @min(fai.line_base, remaining_bases);
-                    try self.stage.ensureTotalCapacity(self.stage.items.len + bases_to_read);
-                    const bytes_read = try reader.read(self.stage.unusedCapacitySlice()[0..bases_to_read]);
-                    if (bytes_read < bases_to_read)
-                        return error.EndOfStream;
-                    self.stage.items.len += bytes_read;
-                    remaining_bases -= bytes_read;
-                    try reader.skipBytes(fai.line_width - fai.line_base, .{ .buf_size = 16 });
-                }
-            }
-            if (!options.skip_qual) {
-                try seek.seekTo(fai.qual_offset); // seek to the offset of the fai
-                var remaining_qual: usize = fai.length;
-                while (remaining_qual > 0) {
-                    const bases_to_read = @min(fai.line_base, remaining_qual);
-                    try self.stage.ensureTotalCapacity(self.stage.items.len + bases_to_read);
-                    const bytes_read = try reader.read(self.stage.unusedCapacitySlice()[0..bases_to_read]);
-                    if (bytes_read < bases_to_read)
-                        return error.EndOfStream;
-                    self.stage.items.len += bytes_read;
-                    remaining_qual -= bytes_read;
-                    try reader.skipBytes(fai.line_width - fai.line_base, .{ .buf_size = 16 });
-                }
-            }
-            return .{
-                .name = fai.name,
-                .seq = self.stage.items[0..fai.length],
-                .qual = if (options.skip_qual) .{} else self.stage.items[fai.length .. fai.length + fai.length],
-            };
-        }
-
-        pub const ParseOptions = struct {};
-
-        pub fn next(self: *Self, comptime options: ParseOptions) (Stream.Reader.Error || ParseErrors || error{OutOfMemory})!?struct {
-            length: u32, // Total length of this reference sequence, in bases
-            offset: usize, // Offset in the FASTA/FASTQ file of this sequence's first base
-            line_base: u32, // The number of bases on each line
-            line_width: u32, // The number of bytes in each line, including the newline
-            qual_offset: usize, // Offset of sequence's first quality within the FASTQ file
-
-            name: []const u8,
-            qual: []const u8,
-            seq: []const u8,
-        } {
-            _ = options;
-            self.stage.shrinkRetainingCapacity(0);
-            var seq_read_offset: usize = 0;
-            var qual_read_offset: usize = 0;
-
-            var reader = self.stream.reader();
-
-            var state: enum { start, name, seq, seq_begin, qual, qual_start } = .start;
-
-            var name_len: usize = 0;
-            var seq_len: u32 = 0;
-            var qual_len: u64 = 0;
-
-            var bases_per_line: u32 = 0;
-            var expected_bases_per_line: ?u32 = null;
-
-            var bytes_per_line: u32 = 0;
-            var expected_bytes_per_line: ?u32 = null;
-
-            var seq_num_lines: usize = 0;
-            var qual_num_lines: usize = 0;
-
-            finished: while (true) {
-                switch (state) {
-                    .start => {
-                        const byte: u8 = reader.readByte() catch |err| switch (err) {
-                            error.EndOfStream => return null, // we just have a name so the buffer is malformed
-                            else => |e| return e,
-                        };
-                        state = switch (byte) {
-                            '@' => .name,
-                            else => return error.RecordParseError,
-                        };
-                    },
-                    .name => {
-                        const byte: u8 = reader.readByte() catch |err| switch (err) {
-                            error.EndOfStream => return null, // we just have a name so the buffer is malformed
-                            else => |e| return e,
-                        };
-                        state = switch (byte) {
-                            '\r' => state, // ignore \r characters
-                            '\n' => .seq_begin, // end of the line
-                            else => l: {
-                                try self.stage.append(byte);
-                                name_len += 1;
-                                break :l state;
-                            },
-                        };
-                    },
-                    .seq_begin => {
-                        const byte: u8 = reader.readByte() catch |err| switch (err) {
-                            error.EndOfStream => '\n', // we just have a name so the buffer is malformed
-                            else => |e| return e,
-                        };
-                        state = switch (byte) {
-                            '+' => .qual_start,
-                            '\n', '\r' => return error.RecordParseError,
-                            else => l: {
-                                if (expected_bytes_per_line) |e|
-                                    if (e != bytes_per_line) return error.RecordParseError;
-
-                                if (expected_bases_per_line) |e|
-                                    if (e != bases_per_line) return error.RecordParseError;
-
-                                bases_per_line = 1;
-                                bytes_per_line = 1;
-                                seq_len += 1;
-                                try self.stage.append(byte);
-
-                                break :l .seq;
-                            },
-                        };
-                    },
-                    .seq => {
-                        const byte: u8 = reader.readByte() catch |err| switch (err) {
-                            error.EndOfStream => return null, // we just have a name so the buffer is malformed
-                            else => |e| return e,
-                        };
-                        bytes_per_line += 1;
-                        state = switch (byte) {
-                            '+' => .qual_start,
-                            '\r' => state,
-                            '\n' => l: {
-                                seq_num_lines += 1;
-                                if (expected_bases_per_line == null) expected_bases_per_line = bases_per_line;
-                                if (expected_bytes_per_line == null) expected_bytes_per_line = bytes_per_line;
-                                break :l .seq_begin;
-                            },
-                            else => l: {
-                                bases_per_line += 1;
-                                try self.stage.append(byte);
-                                seq_len += 1;
-                                break :l state;
-                            },
-                        };
-                    },
-                    .qual, .qual_start => {
-                        const byte: u8 = reader.readByte() catch |err| switch (err) {
-                            error.EndOfStream => return null, // we just have a name so the buffer is malformed
-                            else => |e| return e,
-                        };
-                        state = switch (byte) {
-                            '\r' => .qual,
-                            '\n' => l: {
-                                if (state == .qual) qual_num_lines += 1;
-                                // '@' and '+' can show up in qualifiers
-                                //   the number of sequence characters has to equal qualifiers
-                                if (qual_len == seq_len) break :finished;
-                                if (qual_len > seq_len) return error.RecordParseError;
-                                break :l .qual;
-                            },
-                            else => l: {
-                                if (state == .qual_start)
-                                    qual_read_offset = try self.stream.seekableStream().getPos();
-
-                                try self.stage.append(byte);
-                                qual_len += 1;
-                                break :l .qual;
-                            },
-                        };
-                    },
-                }
-            }
-
-            if (qual_num_lines != seq_num_lines)
-                return error.RecordParseError;
-
-            return .{ .length = seq_len, .offset = seq_read_offset, .line_base = bases_per_line, .line_width = bytes_per_line, .qual_offset = qual_read_offset, 
-                .name = self.stage.items[0..name_len], 
-                .seq = self.stage.items[name_len .. name_len + seq_len], 
-                .qual = self.stage.items[name_len + seq_len .. qual_len + seq_len + name_len] };
-        }
-    };
-}
-
-pub fn fqReader(allocator: std.mem.Allocator, stream: anytype) FqReader(@TypeOf(stream)) {
-    return .{ .stream = stream, .stage = std.ArrayList(u8).init(allocator) };
 }
 
 //test "parse fai index and seek fq" {
@@ -548,58 +271,49 @@ pub fn fqReader(allocator: std.mem.Allocator, stream: anytype) FqReader(@TypeOf(
 test "read fq records t1.fq" {
     const file = @embedFile("./test/t1.fq");
     var stream = std.io.fixedBufferStream(file);
-    var iter = seq.fa.fastaReadIterator(stream);
-    const TestCase = struct { 
-        name: []const u8,
-        sequence: []const u8, 
-        quality: []const u8 
-    };
+    var iter = seq.fa.fastaReadIterator(stream, .{});
+    const TestCase = struct { name: []const u8, sequence: []const u8, quality: []const u8 };
 
     const test_cases =
-        [_]TestCase{
-        .{
-            .name = "HWI-D00523:240:HF3WGBCXX:1:1101:2574:2226 1:N:0:CTGTAG",
-            .sequence = "TGAGGAATATTGGTCAATGGGCGCGAGCCTGAACCAGCCAAGTAGCGTGAAGGATGACTGCCCTACGGGTTGTAAACTTCTTTTATAAAGGAATAAAGTGAGGCACGTGTGCCTTTTTGTATGTACTTTATGAATAAGGATCGGCTAACTCCGTGCCAGCAGCCGCGGTAATACGGAGGATCCGAGCGTTATCCGGATTTATTGGGTTTAAAGGGTGCGCAGGCGGT",
-            .quality = "HIHIIIIIHIIHGHHIHHIIIIIIIIIIIIIIIHHIIIIIHHIHIIIIIGIHIIIIHHHHHHGHIHIIIIIIIIIIIGHIIIIIGHIIIIHIIHIHHIIIIHIHHIIIIIIIGIIIIIIIHIIIIIGHIIIIHIIIH?DGHEEGHIIIIIIIIIIIHIIHIIIHHIIHIHHIHCHHIIHGIHHHHHHH<GG?B@EHDE-BEHHHII5B@GHHF?CGEHHHDHIHIIH"
-        }, 
-        .{
+        [_]TestCase{ .{ .name = "HWI-D00523:240:HF3WGBCXX:1:1101:2574:2226 1:N:0:CTGTAG", .sequence = "TGAGGAATATTGGTCAATGGGCGCGAGCCTGAACCAGCCAAGTAGCGTGAAGGATGACTGCCCTACGGGTTGTAAACTTCTTTTATAAAGGAATAAAGTGAGGCACGTGTGCCTTTTTGTATGTACTTTATGAATAAGGATCGGCTAACTCCGTGCCAGCAGCCGCGGTAATACGGAGGATCCGAGCGTTATCCGGATTTATTGGGTTTAAAGGGTGCGCAGGCGGT", .quality = "HIHIIIIIHIIHGHHIHHIIIIIIIIIIIIIIIHHIIIIIHHIHIIIIIGIHIIIIHHHHHHGHIHIIIIIIIIIIIGHIIIIIGHIIIIHIIHIHHIIIIHIHHIIIIIIIGIIIIIIIHIIIIIGHIIIIHIIIH?DGHEEGHIIIIIIIIIIIHIIHIIIHHIIHIHHIHCHHIIHGIHHHHHHH<GG?B@EHDE-BEHHHII5B@GHHF?CGEHHHDHIHIIH" }, .{ .name = "HWI-D00523:240:HF3WGBCXX:1:1101:5586:3020 1:N:0:CTGTAG", .sequence = "TGGGGAATATTGGGCAATGGGCGGAAGCCTGACCCAGCAACGCCGCGTGAAGGAAGAAGGCCCTCGGGTTGTAAACTTCTTTTCTATAGGACGAAGAAGTGACGGTACTATAGGAATAAGCCACGGCTAACTACGTGCCAGCAGCCGCGGTAATACGTAGGTGGCGAGCGTTATCCGGATTTACTGGGTGTAAAGGGCGTGTAGGCGGGAGAGCAAGTCAGATGTGA", .quality = "EHEHGIIIHIGGHGHFEHHEHGCHHGGHIIIGHHIFHHGHHIEHIIIIGHHHHIIGIHGHGGHHHHHCHHHICCHHHHH@HHIIIGCEHGHHGHCHHGDGCGCCEHEEHGIIGHHGHHHIGGFCFHHIHIGIIIHGGHFHIIFEFHIIHIGDHCHFHHGCHCE?GHIIH<C?GHHHHIGFDEHHHHEC88@<@@EHHHIHDH-@HHCDHHDDEHH6@F6@6@@EH@@" }, .{ .name = "HWI-D00523:240:HF3WGBCXX:1:1101:2860:2149 1:N:0:CTGTAG", .sequence = "TAGGGAATATTGCTCAATGGGGGAAACCCTGAAGCAGCAACGCCGCGTGGAGGATGAAGGTTTTAGGATTGTAAACTCCTTTTGTGAGAGAAGATTATGACGGTATCTCACGAATAAGCTCCGGCTAACTACGTGCCAGCAGCCGCGGTAATACGTAGGGAGCGAGCGTTGTCCGGAATTACTGGGTGTAAAGGGAGCGTAGGCGGGACTGCAAGTTGGGTGTCAAA", .quality = "HGHHGHIIHIIIIIIHHHIIHIIIIIHGHCHIHIIHIIHIIIIIIIIIHIGHIEHIHIIG<FEHHHIHHIIIIIIHIFFHHHHIIIIIHHHHGHFEHHIHHHIHEHHFHHHIHIIIIIIIHIHDHHHHHEHHIIGIIHHIIGHHHIIGDDAGGHHFHHHIHICHHHGH,GHHHHGCEHEG?@6@G?-@>HHHHHHHDEH<@H-@CDD>:E?@GHEF-@E:@H+@-@@" } };
 
-            .name = "HWI-D00523:240:HF3WGBCXX:1:1101:5586:3020 1:N:0:CTGTAG",
-            .sequence = "TGGGGAATATTGGGCAATGGGCGGAAGCCTGACCCAGCAACGCCGCGTGAAGGAAGAAGGCCCTCGGGTTGTAAACTTCTTTTCTATAGGACGAAGAAGTGACGGTACTATAGGAATAAGCCACGGCTAACTACGTGCCAGCAGCCGCGGTAATACGTAGGTGGCGAGCGTTATCCGGATTTACTGGGTGTAAAGGGCGTGTAGGCGGGAGAGCAAGTCAGATGTGA",
-            .quality = "EHEHGIIIHIGGHGHFEHHEHGCHHGGHIIIGHHIFHHGHHIEHIIIIGHHHHIIGIHGHGGHHHHHCHHHICCHHHHH@HHIIIGCEHGHHGHCHHGDGCGCCEHEEHGIIGHHGHHHIGGFCFHHIHIGIIIHGGHFHIIFEFHIIHIGDHCHFHHGCHCE?GHIIH<C?GHHHHIGFDEHHHHEC88@<@@EHHHIHDH-@HHCDHHDDEHH6@F6@6@@EH@@"
-        }, 
-        .{
+    const FaTestRecord = struct {
+        const Self = @This();
 
-            .name = "HWI-D00523:240:HF3WGBCXX:1:1101:2860:2149 1:N:0:CTGTAG",
-            .sequence = "TAGGGAATATTGCTCAATGGGGGAAACCCTGAAGCAGCAACGCCGCGTGGAGGATGAAGGTTTTAGGATTGTAAACTCCTTTTGTGAGAGAAGATTATGACGGTATCTCACGAATAAGCTCCGGCTAACTACGTGCCAGCAGCCGCGGTAATACGTAGGGAGCGAGCGTTGTCCGGAATTACTGGGTGTAAAGGGAGCGTAGGCGGGACTGCAAGTTGGGTGTCAAA",
-            .quality = "HGHHGHIIHIIIIIIHHHIIHIIIIIHGHCHIHIIHIIHIIIIIIIIIHIGHIEHIHIIG<FEHHHIHHIIIIIIHIFFHHHHIIIIIHHHHGHFEHHIHHHIHEHHFHHHIHIIIIIIIHIHDHHHHHEHHIIGIIHHIIGHHHIIGDDAGGHHFHHHIHICHHHGH,GHHHHGCEHEG?@6@G?-@>HHHHHHHDEH<@H-@CDD>:E?@GHEF-@E:@H+@-@@"
+        name: std.ArrayListUnmanaged(u8),
+        qual: std.ArrayListUnmanaged(u8),
+        seq: std.ArrayListUnmanaged(u8),
+
+        pub const StreamError = error{OutOfMemory};
+        pub const FaStreamConsumer = seq.fa.Consumer(*Self, StreamError, writeName, writeSeq, writeQual);
+        fn writeName(self: *Self, buf: []const u8) StreamError!void {
+            try self.name.appendSlice(std.testing.allocator, buf);
+        }
+        fn writeQual(self: *Self, buf: []const u8) StreamError!void {
+            try self.qual.appendSlice(std.testing.allocator, buf);
+        }
+        fn writeSeq(self: *Self, buf: []const u8) StreamError!void {
+            try self.seq.appendSlice(std.testing.allocator, buf);
         }
     };
-
-    var record: FaRecord = FaRecord.init(std.testing.allocator);
-    defer record.deinit();
-    for (test_cases) |case| {
-        if(try iter.next(&record, .{})) {
-            try testing.expectEqualStrings(case.name, record.name.items);
-            try testing.expectEqualStrings(case.sequence, record.seq.items);
-            try testing.expectEqualStrings(case.quality, record.qual.items);
-        } else try testing.expect(false);
-        record.reset();
+    var faTestRecord: FaTestRecord = .{ .name = .{}, .seq = .{}, .qual = .{} };
+    defer {
+        faTestRecord.qual.deinit(std.testing.allocator);
+        faTestRecord.seq.deinit(std.testing.allocator);
+        faTestRecord.name.deinit(std.testing.allocator);
     }
 
-    // defer iter.deinit();
-   // if (try iter.next(record.fastaWriter(), .{}) {
-   //     try testing.expectEqualStrings("HWI-D00523:240:HF3WGBCXX:1:1101:2574:2226 1:N:0:CTGTAG", result.name);
-   //     try testing.expectEqualStrings("TGAGGAATATTGGTCAATGGGCGCGAGCCTGAACCAGCCAAGTAGCGTGAAGGATGACTGCCCTACGGGTTGTAAACTTCTTTTATAAAGGAATAAAGTGAGGCACGTGTGCCTTTTTGTATGTACTTTATGAATAAGGATCGGCTAACTCCGTGCCAGCAGCCGCGGTAATACGGAGGATCCGAGCGTTATCCGGATTTATTGGGTTTAAAGGGTGCGCAGGCGGT", result.seq);
-   // } else try testing.expect(false);
-
-   // if (try fqReadIter.next(.{})) |result| {
-   //     try testing.expectEqualStrings("HWI-D00523:240:HF3WGBCXX:1:1101:5586:3020 1:N:0:CTGTAG", result.name);
-   // } else try testing.expect(false);
-
-   // if (try fqReadIter.next(.{})) |result| {
-   //     try testing.expectEqualStrings("HWI-D00523:240:HF3WGBCXX:1:1101:2860:2149 1:N:0:CTGTAG", result.name);
-   // } else try testing.expect(false);
+    var con: FaTestRecord.FaStreamConsumer = .{ .context = &faTestRecord };
+    for (test_cases) |case| {
+        if (try iter.next(con)) {
+            try testing.expectEqualStrings(case.name, faTestRecord.name.items);
+            try testing.expectEqualStrings(case.sequence, faTestRecord.seq.items);
+            try testing.expectEqualStrings(case.quality, faTestRecord.qual.items);
+        } else try testing.expect(false);
+        faTestRecord.qual.clearRetainingCapacity();
+        faTestRecord.seq.clearRetainingCapacity();
+        faTestRecord.name.clearRetainingCapacity();
+    }
 }
 
 //test "writing fq to buffer" {

@@ -10,7 +10,7 @@ pub const fa = @import("./fa.zig");
 //pub const fqReader = fa.fqReader;
 
 //pub const faiWriter = fai.faiWriter;
-pub const faiReader = fai.faiReader;
+pub const faiReader = fai.faiReaderIterator;
 
 test {
     _ = fai;
