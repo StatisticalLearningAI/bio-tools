@@ -4,13 +4,12 @@ const testing = std.testing;
 
 const ColumnIdx = enum(u8) { name = 0, length = 1, offset = 2, line_bases = 3, line_width = 4, qual_offset = 5 };
 
-
 // http://www.htslib.org/doc/faidx.html
 // faidx – an index enabling random access to FASTA and FASTQ files
 // if the reserved is 0 then we assume its a const []u8 else the entry takes up some amount of reserved memory
 pub const FastaIndex = struct {
     const Self = @This();
-    length: u32 = 0,  // Total length of this reference sequence, in bases
+    length: u32 = 0, // Total length of this reference sequence, in bases
     offset: u64 = 0, // Offset in the FASTA/FASTQ file of this sequence's first base
     line_base: u32 = 0, // The number of bases on each line
     line_width: u32 = 0, // The number of bytes in each line, including the newline
@@ -23,47 +22,50 @@ pub fn FastaIndexRecord(comptime options: IndexOptions) type {
     return struct {
         const Self = @This();
         name: std.BoundedArray(u8, options.reserve_len) = undefined,
-        length: u32 = 0,  // Total length of this reference sequence, in bases
+        length: u32 = 0, // Total length of this reference sequence, in bases
         offset: u64 = 0, // Offset in the FASTA/FASTQ file of this sequence's first base
         line_base: u32 = 0, // The number of bases on each line
         line_width: u32 = 0, // The number of bytes in each line, including the newline
         qual_offset: u64 = 0, // Offset of sequence's first quality within the FASTQ file
 
-        pub fn reset(self: *Self) void{
+        pub fn reset(self: *Self) void {
             self.name.resize(0) catch unreachable;
         }
     };
 }
 
-pub const FaiReadIterOptions = struct {
-    reserve_len: usize = 4096, 
+pub const FaiFaIndex = struct {
+    name: []const u8,
+    length: u32 = 0, // Total length of this reference sequence, in bases
+    offset: u64 = 0, // Offset in the FASTA/FASTQ file of this sequence's first base
+    line_base: u32 = 0, // The number of bases on each line
+    line_width: u32 = 0, // The number of bytes in each line, including the newline
 };
 
-pub fn FaiReadIterator(comptime Stream: type, comptime container: seq.SeqContianer, comptime options: FaiReadIterOptions) type {
+pub const FaiFaqIndex = struct {
+    name: []const u8,
+    length: u32 = 0, // Total length of this reference sequence, in bases
+    offset: u64 = 0, // Offset in the FASTA/FASTQ file of this sequence's first base
+    line_base: u32 = 0, // The number of bases on each line
+    line_width: u32 = 0, // The number of bytes in each line, including the newline
+    qual_offset: u64 = 0, // Offset of sequence's first quality within the FASTQ file
+};
+
+pub const FaiReadIterOptions = struct {
+    reserve_len: usize = 4096,
+};
+
+pub fn FastaIndexReadIterator(comptime Stream: type, comptime container: seq.SeqContainer, comptime options: FaiReadIterOptions) type {
     return struct {
         stream: Stream,
         buffer: [options.reserve_len]u8 = undefined,
         const Self = @This();
 
-        pub fn next(self: *Self) (anyerror || error{ UnexpectedNumberColum, Overflow, ParseError })!?switch(container) {
-            .fasta => struct {
-                name: []const u8,
-                length: u32 = 0,  // Total length of this reference sequence, in bases
-                offset: u64 = 0, // Offset in the FASTA/FASTQ file of this sequence's first base
-                line_base: u32 = 0, // The number of bases on each line
-                line_width: u32 = 0, // The number of bytes in each line, including the newline
-            },
-            .fastq => struct {
-                name: []const u8,
-                length: u32 = 0,  // Total length of this reference sequence, in bases
-                offset: u64 = 0, // Offset in the FASTA/FASTQ file of this sequence's first base
-                line_base: u32 = 0, // The number of bases on each line
-                line_width: u32 = 0, // The number of bytes in each line, including the newline
-                qual_offset: u64 = 0, // Offset of sequence's first quality within the FASTQ file
-            },
-            else => unreachable
-            
-        }{
+        pub fn next(self: *Self) (anyerror || error{ UnexpectedNumberColum, Overflow, ParseError })!?switch (container) {
+            .fasta => FaiFaIndex,
+            .fastq => FaiFaqIndex,
+            else => unreachable,
+        } {
             var reader = self.stream.reader();
             var col: u8 = 0;
             var pos: usize = 0;
@@ -118,34 +120,25 @@ pub fn FaiReadIterator(comptime Stream: type, comptime container: seq.SeqContian
                     },
                     else => {
                         self.buffer[pos] = byte;
-                        pos+=1;
+                        pos += 1;
                     },
                 }
             }
             switch (comptime container) {
                 .fastq => {
-                    if(col != 6) 
+                    if (col != 6)
                         return error.UnexpectedNumberColum; // the column
-                   
-                    return .{
-                        .name = self.buffer[0..name_len], 
-                        .length = length, 
-                        .offset = offset, 
-                        .line_base = line_base, 
-                        .line_width = line_width, 
-                        .qual_offset = qual_offset  
-                    };
+                    return .{ .name = self.buffer[0..name_len], .length = length, .offset = offset, .line_base = line_base, .line_width = line_width, .qual_offset = qual_offset };
                 },
                 .fasta => {
-                    if(col != 5) 
+                    if (col != 5)
                         return error.UnexpectedNumberColum; // the column
-            
                     return .{
-                        .name = self.buffer[0..name_len], 
-                        .length = length, 
-                        .offset = offset, 
-                        .line_base = line_base, 
-                        .line_width = line_width, 
+                        .name = self.buffer[0..name_len],
+                        .length = length,
+                        .offset = offset,
+                        .line_base = line_base,
+                        .line_width = line_width,
                     };
                 },
                 else => unreachable,
@@ -154,8 +147,163 @@ pub fn FaiReadIterator(comptime Stream: type, comptime container: seq.SeqContian
     };
 }
 
-pub fn faiReaderIterator(stream: anytype, comptime container: seq.SeqContianer, comptime options: FaiReadIterOptions) FaiReadIterator(@TypeOf(stream), container, options) {
+pub fn faiReaderIterator(stream: anytype, comptime container: seq.SeqContainer, comptime options: FaiReadIterOptions) FastaIndexReadIterator(@TypeOf(stream), container, options) {
     return .{ .stream = stream };
+}
+
+pub const FastaIndexOptions = struct {
+    reserve_len: usize = 4096,
+};
+
+
+pub fn FastaIndexReader(comptime Stream: type, comptime container: seq.SeqContainer, comptime options: FastaIndexOptions) type {
+    return struct { 
+        const Self = @This();
+        
+        stream: Stream,
+        buffer: [options.reserve_len]u8 = undefined,
+
+
+        pub fn Consumer(comptime Context: type, 
+            comptime StreamError: type, 
+            comptime fnWriteSeq: fn (self: Context, buf: []const u8) StreamError!void, 
+            comptime fnWriteQual: fn (self: Context, buf: []const u8) StreamError!void) type {
+            return struct {
+                context: Context,
+                pub const Error = StreamError;
+                pub inline fn writeSeq(self: @This(), buf: []const u8) StreamError!void {
+                    try fnWriteSeq(self.context, buf);
+                }
+                pub inline fn writeQual(self: @This(), buf: []const u8) StreamError!void {
+                    try fnWriteQual(self.context, buf);
+                }
+            };
+        }
+
+
+        pub fn read(self: *Self, index: switch (container) {
+            .fasta => struct {
+                length: u32 = 0, // Total length of this reference sequence, in bases
+                offset: u64 = 0, // Offset in the FASTA/FASTQ file of this sequence's first base
+                line_base: u32 = 0, // The number of bases on each line
+                line_width: u32 = 0, // The number of bytes in each line, including the newline
+            },
+            .fastq => struct {
+                length: u32 = 0, // Total length of this reference sequence, in bases
+                offset: u64 = 0, // Offset in the FASTA/FASTQ file of this sequence's first base
+                line_base: u32 = 0, // The number of bases on each line
+                line_width: u32 = 0, // The number of bytes in each line, including the newline
+                qual_offset: u64 = 0, // Offset of sequence's first quality within the FASTQ file
+            },
+            else => unreachable,
+        }, consumer: anytype) (@TypeOf(consumer).Error || Stream.ReadError || error{ EndOfStream, BufferOverflow, RecordParseError })!bool {
+            var reader = self.stream.reader();
+            var seek = self.stream.seekableStream();
+            {
+                try seek.seekTo(index.offset); // seek to the offset of the fai
+                var remaining_bases: usize = index.length;
+                while (remaining_bases > 0) {
+                    var bases_to_read: usize  = @min(index.line_base, remaining_bases);
+                    more_bases: while(true) {
+                        const num_bytes: usize  = try reader.read(self.buffer[0..@min(bases_to_read, options.reserve_len)]);
+                        if(num_bytes == 0) return false; 
+                        try consumer.writeSeq(self.buffer[0..num_bytes]);
+                        remaining_bases -= num_bytes;
+                        bases_to_read -= num_bytes;
+                        
+                        if(bases_to_read > 0) continue :more_bases;
+                        break :more_bases;
+                    }
+                    try reader.skipBytes(index.line_width - index.line_base, .{ .buf_size = 16 });
+                }
+            }
+            switch(container) {
+                .fastq => {
+                    try seek.seekTo(index.qual_offset); // seek to the offset of the fai
+                    var remaining_bases: usize = index.length;
+                    while (remaining_bases > 0) {
+                        var bases_to_read: usize  = @min(index.line_base, remaining_bases);
+                        more_bases: while(true) {
+                            const num_bytes: usize = try reader.read(self.buffer[0..@min(bases_to_read, options.reserve_len)]);
+                            if(num_bytes == 0) return false; 
+                            try consumer.writeQual(self.buffer[0..num_bytes]);
+                            remaining_bases -= num_bytes;
+                            bases_to_read -= num_bytes;
+                            if(bases_to_read > 0) continue :more_bases;
+                            break :more_bases;
+                        }
+                        try reader.skipBytes(index.line_width - index.line_base, .{ .buf_size = 16 });
+                    }
+                },
+                else => {}
+            }
+            return true;
+        }
+    };
+}
+
+pub fn fastaIndexReader(stream: anytype, comptime container: seq.SeqContainer, comptime options: FastaIndexOptions) FastaIndexReader(@TypeOf(stream), container, options) {
+    return .{ .stream = stream };
+}
+
+
+
+
+test "parse fai index and seek fq" {
+    //const indexFile = @embedFile("./test/t3.fq.fai");
+    const fq = @embedFile("./test/t3.fq");
+    var fqStream = std.io.fixedBufferStream(fq);
+    const TestCase = struct {
+        length: u32,
+        offset: u64,
+        line_base: u32 ,
+        line_width: u32 , 
+        qual_offset: u64 
+        , seq: []const u8, qual: []const u8 };
+
+    const FaTestRecord = struct {
+        const Self = @This();
+
+        qual: std.ArrayListUnmanaged(u8),
+        seq: std.ArrayListUnmanaged(u8),
+
+        pub const StreamError = error{OutOfMemory};
+        fn writeQual(self: *Self, buf: []const u8) StreamError!void {
+            try self.qual.appendSlice(std.testing.allocator, buf);
+        }
+        fn writeSeq(self: *Self, buf: []const u8) StreamError!void {
+            try self.seq.appendSlice(std.testing.allocator, buf);
+        }
+    };
+
+    var faTestRecord: FaTestRecord = .{ .seq = .{}, .qual = .{} };
+    defer {
+        faTestRecord.qual.deinit(std.testing.allocator);
+        faTestRecord.seq.deinit(std.testing.allocator);
+    }
+
+    var reader = fastaIndexReader(fqStream, .fastq, .{});
+    const test_cases =
+        [_]TestCase{
+        .{ .length = 63, .offset = 85, .line_base = 63, .line_width = 64, .qual_offset = 151, .seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACG", .qual = "@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~" },
+        .{ .length = 63, .offset = 1590, .line_base = 63, .line_width = 64, .qual_offset = 1656, .seq = "GCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA", .qual = "~}|{zyxwvutsrqponmlkjihgfedcba`_^]\\[ZYXWVUTSRQPONMLKJIHGFEDCBA@" },
+    };
+
+    var consumer: @TypeOf(reader).Consumer(*FaTestRecord, error{OutOfMemory}, FaTestRecord.writeSeq, FaTestRecord.writeQual) = .{.context = &faTestRecord}; 
+    for (test_cases) |case| {
+        if(try reader.read(.{
+           .length = case.length,
+            .offset = case.offset,
+            .line_base = case.line_base,
+            .line_width = case.line_width,
+            .qual_offset = case.qual_offset
+        }, consumer )) {
+            try testing.expectEqualStrings(case.seq, faTestRecord.seq.items);
+            try testing.expectEqualStrings(case.qual, faTestRecord.qual.items);
+        } else try testing.expect(false);
+        faTestRecord.qual.clearRetainingCapacity();
+        faTestRecord.seq.clearRetainingCapacity();
+    }
 }
 
 test "fastq parse fai index" {
@@ -163,14 +311,7 @@ test "fastq parse fai index" {
     var stream = std.io.fixedBufferStream(file);
     var reader = faiReaderIterator(stream, .fastq, .{});
     const test_cases =
-        [_]struct {
-        name: []const u8,
-        length: u32,
-        offset: u32,
-        line_base: u32,
-        line_width: u32,
-        qual_offset: u32
-    }{
+        [_]struct { name: []const u8, length: u32, offset: u32, line_base: u32, line_width: u32, qual_offset: u32 }{
         .{ .name = "FAKE0005_1", .length = 63, .offset = 85, .line_base = 63, .line_width = 64, .qual_offset = 151 },
         .{ .name = "FAKE0006_1", .length = 63, .offset = 300, .line_base = 63, .line_width = 64, .qual_offset = 366 },
         .{ .name = "FAKE0005_2", .length = 63, .offset = 515, .line_base = 63, .line_width = 64, .qual_offset = 581 },
@@ -181,7 +322,7 @@ test "fastq parse fai index" {
         .{ .name = "FAKE0006_4", .length = 63, .offset = 1590, .line_base = 63, .line_width = 64, .qual_offset = 1656 },
     };
     for (test_cases) |case| {
-        if (try reader.next()) |record|  {
+        if (try reader.next()) |record| {
             try testing.expectEqualStrings(case.name, record.name);
             try testing.expectEqual(@as(u64, case.length), record.length);
             try testing.expectEqual(@as(u64, case.offset), record.offset);
@@ -197,7 +338,7 @@ test "fasta parse fai index" {
     var reader = faiReaderIterator(stream, .fasta, .{});
 
     const test_cases =
-        [_]struct{
+        [_]struct {
         name: []const u8,
         length: u32,
         offset: u32,

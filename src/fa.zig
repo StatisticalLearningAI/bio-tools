@@ -44,22 +44,6 @@ pub fn fqWriter(stream: anytype, option: FqWriteOption) FqWriter(@TypeOf(stream.
     };
 }
 
-pub fn Consumer(comptime Context: type, comptime StreamError: type, comptime fnWriteName: fn (self: Context, buf: []const u8) StreamError!void, comptime fnWriteSeq: fn (self: Context, buf: []const u8) StreamError!void, comptime fnWriteQual: fn (self: Context, buf: []const u8) StreamError!void) type {
-    return struct {
-        context: Context,
-        pub const Self = @This();
-        pub const Error = StreamError;
-        inline fn writeName(self: Self, buf: []const u8) StreamError!void {
-            try fnWriteName(self.context, buf);
-        }
-        inline fn writeSeq(self: Self, buf: []const u8) StreamError!void {
-            try fnWriteSeq(self.context, buf);
-        }
-        inline fn writeQual(self: Self, buf: []const u8) StreamError!void {
-            try fnWriteQual(self.context, buf);
-        }
-    };
-}
 pub const FaReadIterOptions = struct {
     reserve_len: usize = 4096,
 };
@@ -68,10 +52,11 @@ pub fn FaReadIterator(comptime Stream: type, comptime options: FaReadIterOptions
     return struct {
         const Self = @This();
 
+
         stream: Stream,
         buffer: [options.reserve_len]u8 = undefined,
         state: enum { start, name, seq, qual } = .start,
-        format: seq.SeqContianer = .fastq,
+        format: seq.SeqContainer = .fastq,
 
         pub fn next(self: *Self, consumer: anytype) (@TypeOf(consumer).Error || Stream.ReadError || error{ BufferOverflow, RecordParseError })!bool {
             var stage = std.io.fixedBufferStream(&self.buffer);
@@ -235,13 +220,8 @@ pub fn FaReadIterator(comptime Stream: type, comptime options: FaReadIterOptions
     };
 }
 
-pub fn fastaReadUsingIndex(comptime container: seq.SeqContianer, stream: anytype, record: anytype, index: seq.fai.FastaIndex) !bool {
-    _ = index;
-    _ = record;
-    _ = stream;
-    _ = container;
-    return true;
-}
+
+
 
 pub fn fastaReadIterator(stream: anytype, comptime options: FaReadIterOptions) FaReadIterator(@TypeOf(stream), options) {
     return .{ .stream = stream };
@@ -274,8 +254,24 @@ test "read fq records t1.fq" {
     var iter = seq.fa.fastaReadIterator(stream, .{});
     const TestCase = struct { name: []const u8, sequence: []const u8, quality: []const u8 };
 
+    // zig fmt: off
     const test_cases =
-        [_]TestCase{ .{ .name = "HWI-D00523:240:HF3WGBCXX:1:1101:2574:2226 1:N:0:CTGTAG", .sequence = "TGAGGAATATTGGTCAATGGGCGCGAGCCTGAACCAGCCAAGTAGCGTGAAGGATGACTGCCCTACGGGTTGTAAACTTCTTTTATAAAGGAATAAAGTGAGGCACGTGTGCCTTTTTGTATGTACTTTATGAATAAGGATCGGCTAACTCCGTGCCAGCAGCCGCGGTAATACGGAGGATCCGAGCGTTATCCGGATTTATTGGGTTTAAAGGGTGCGCAGGCGGT", .quality = "HIHIIIIIHIIHGHHIHHIIIIIIIIIIIIIIIHHIIIIIHHIHIIIIIGIHIIIIHHHHHHGHIHIIIIIIIIIIIGHIIIIIGHIIIIHIIHIHHIIIIHIHHIIIIIIIGIIIIIIIHIIIIIGHIIIIHIIIH?DGHEEGHIIIIIIIIIIIHIIHIIIHHIIHIHHIHCHHIIHGIHHHHHHH<GG?B@EHDE-BEHHHII5B@GHHF?CGEHHHDHIHIIH" }, .{ .name = "HWI-D00523:240:HF3WGBCXX:1:1101:5586:3020 1:N:0:CTGTAG", .sequence = "TGGGGAATATTGGGCAATGGGCGGAAGCCTGACCCAGCAACGCCGCGTGAAGGAAGAAGGCCCTCGGGTTGTAAACTTCTTTTCTATAGGACGAAGAAGTGACGGTACTATAGGAATAAGCCACGGCTAACTACGTGCCAGCAGCCGCGGTAATACGTAGGTGGCGAGCGTTATCCGGATTTACTGGGTGTAAAGGGCGTGTAGGCGGGAGAGCAAGTCAGATGTGA", .quality = "EHEHGIIIHIGGHGHFEHHEHGCHHGGHIIIGHHIFHHGHHIEHIIIIGHHHHIIGIHGHGGHHHHHCHHHICCHHHHH@HHIIIGCEHGHHGHCHHGDGCGCCEHEEHGIIGHHGHHHIGGFCFHHIHIGIIIHGGHFHIIFEFHIIHIGDHCHFHHGCHCE?GHIIH<C?GHHHHIGFDEHHHHEC88@<@@EHHHIHDH-@HHCDHHDDEHH6@F6@6@@EH@@" }, .{ .name = "HWI-D00523:240:HF3WGBCXX:1:1101:2860:2149 1:N:0:CTGTAG", .sequence = "TAGGGAATATTGCTCAATGGGGGAAACCCTGAAGCAGCAACGCCGCGTGGAGGATGAAGGTTTTAGGATTGTAAACTCCTTTTGTGAGAGAAGATTATGACGGTATCTCACGAATAAGCTCCGGCTAACTACGTGCCAGCAGCCGCGGTAATACGTAGGGAGCGAGCGTTGTCCGGAATTACTGGGTGTAAAGGGAGCGTAGGCGGGACTGCAAGTTGGGTGTCAAA", .quality = "HGHHGHIIHIIIIIIHHHIIHIIIIIHGHCHIHIIHIIHIIIIIIIIIHIGHIEHIHIIG<FEHHHIHHIIIIIIHIFFHHHHIIIIIHHHHGHFEHHIHHHIHEHHFHHHIHIIIIIIIHIHDHHHHHEHHIIGIIHHIIGHHHIIGDDAGGHHFHHHIHICHHHGH,GHHHHGCEHEG?@6@G?-@>HHHHHHHDEH<@H-@CDD>:E?@GHEF-@E:@H+@-@@" } };
+        [_]TestCase{ 
+        .{ 
+            .name = "HWI-D00523:240:HF3WGBCXX:1:1101:2574:2226 1:N:0:CTGTAG", 
+            .sequence = "TGAGGAATATTGGTCAATGGGCGCGAGCCTGAACCAGCCAAGTAGCGTGAAGGATGACTGCCCTACGGGTTGTAAACTTCTTTTATAAAGGAATAAAGTGAGGCACGTGTGCCTTTTTGTATGTACTTTATGAATAAGGATCGGCTAACTCCGTGCCAGCAGCCGCGGTAATACGGAGGATCCGAGCGTTATCCGGATTTATTGGGTTTAAAGGGTGCGCAGGCGGT", 
+            .quality = "HIHIIIIIHIIHGHHIHHIIIIIIIIIIIIIIIHHIIIIIHHIHIIIIIGIHIIIIHHHHHHGHIHIIIIIIIIIIIGHIIIIIGHIIIIHIIHIHHIIIIHIHHIIIIIIIGIIIIIIIHIIIIIGHIIIIHIIIH?DGHEEGHIIIIIIIIIIIHIIHIIIHHIIHIHHIHCHHIIHGIHHHHHHH<GG?B@EHDE-BEHHHII5B@GHHF?CGEHHHDHIHIIH" }, 
+        .{ 
+            .name = "HWI-D00523:240:HF3WGBCXX:1:1101:5586:3020 1:N:0:CTGTAG", 
+            .sequence = "TGGGGAATATTGGGCAATGGGCGGAAGCCTGACCCAGCAACGCCGCGTGAAGGAAGAAGGCCCTCGGGTTGTAAACTTCTTTTCTATAGGACGAAGAAGTGACGGTACTATAGGAATAAGCCACGGCTAACTACGTGCCAGCAGCCGCGGTAATACGTAGGTGGCGAGCGTTATCCGGATTTACTGGGTGTAAAGGGCGTGTAGGCGGGAGAGCAAGTCAGATGTGA", 
+            .quality = "EHEHGIIIHIGGHGHFEHHEHGCHHGGHIIIGHHIFHHGHHIEHIIIIGHHHHIIGIHGHGGHHHHHCHHHICCHHHHH@HHIIIGCEHGHHGHCHHGDGCGCCEHEEHGIIGHHGHHHIGGFCFHHIHIGIIIHGGHFHIIFEFHIIHIGDHCHFHHGCHCE?GHIIH<C?GHHHHIGFDEHHHHEC88@<@@EHHHIHDH-@HHCDHHDDEHH6@F6@6@@EH@@" }, 
+        .{ 
+            .name = "HWI-D00523:240:HF3WGBCXX:1:1101:2860:2149 1:N:0:CTGTAG", 
+            .sequence = "TAGGGAATATTGCTCAATGGGGGAAACCCTGAAGCAGCAACGCCGCGTGGAGGATGAAGGTTTTAGGATTGTAAACTCCTTTTGTGAGAGAAGATTATGACGGTATCTCACGAATAAGCTCCGGCTAACTACGTGCCAGCAGCCGCGGTAATACGTAGGGAGCGAGCGTTGTCCGGAATTACTGGGTGTAAAGGGAGCGTAGGCGGGACTGCAAGTTGGGTGTCAAA", 
+            .quality = "HGHHGHIIHIIIIIIHHHIIHIIIIIHGHCHIHIIHIIHIIIIIIIIIHIGHIEHIHIIG<FEHHHIHHIIIIIIHIFFHHHHIIIIIHHHHGHFEHHIHHHIHEHHFHHHIHIIIIIIIHIHDHHHHHEHHIIGIIHHIIGHHHIIGDDAGGHHFHHHIHICHHHGH,GHHHHGCEHEG?@6@G?-@>HHHHHHHDEH<@H-@CDD>:E?@GHEF-@E:@H+@-@@" 
+        } 
+    };
+    // zig fmt: on 
 
     const FaTestRecord = struct {
         const Self = @This();
@@ -285,7 +281,7 @@ test "read fq records t1.fq" {
         seq: std.ArrayListUnmanaged(u8),
 
         pub const StreamError = error{OutOfMemory};
-        pub const FaStreamConsumer = seq.fa.Consumer(*Self, StreamError, writeName, writeSeq, writeQual);
+        pub const FaStreamConsumer = seq.consumer.SeqQualConsumer(*Self, StreamError, writeName, writeSeq, writeQual);
         fn writeName(self: *Self, buf: []const u8) StreamError!void {
             try self.name.appendSlice(std.testing.allocator, buf);
         }
