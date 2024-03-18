@@ -44,42 +44,80 @@ pub fn fqWriter(stream: anytype, option: FqWriteOption) FqWriter(@TypeOf(stream.
     };
 }
 
-pub const FaReadIterOptions = struct {
-    reserve_len: usize = 4096,
+pub const ReadIterOptions = struct {
+    reserve_len: usize = 2048,
 };
 
-pub fn FaReadIterator(comptime Stream: type, comptime options: FaReadIterOptions) type {
+fn streamIntoArrayUntilDelim(stream: anytype, buffer: []u8, delimter: u8) error{StreamTooLong, EndOfStream}![]u8{
+    var pos: usize= 0;
+    while(true) {
+        const byte = try stream.readByte();
+        if(byte == delimter) break;
+        buffer[pos] = byte;
+        pos += 1;
+        if(pos == buffer.len) return error.StreamTooLong;
+    }
+    return buffer[0..pos];
+}
+
+
+
+pub fn Scanner(comptime Stream: type, comptime options: ReadIterOptions) type {
     return struct {
         const Self = @This();
 
-
         stream: Stream,
-        buffer: [options.reserve_len]u8 = undefined,
-        state: enum { start, name, seq, qual } = .start,
+        buffer: [options.reserve_len]u8 = undefined, // staged data on the stack for the iter
+        pos: usize = 0,
+        state: enum { start, name, seq, seq_end, qual, qual_end} = .start,
         format: seq.SeqContainer = .fastq,
 
-        pub fn next(self: *Self, consumer: anytype) (@TypeOf(consumer).Error || Stream.ReadError || error{ BufferOverflow, RecordParseError })!bool {
-            var stage = std.io.fixedBufferStream(&self.buffer);
+        seq_line_count: u32 = 0,
+        qual_line_count: u32 = 0,
 
+        seq_number_bases: usize = 0,
+        qual_number_bases: usize = 0,
+
+        bytes_per_line: usize = 0,
+        bytes_per_line_expected: ?usize = null,
+
+        bases_per_line: usize = 0,
+        bases_per_line_expected: ?usize = null,
+
+        buffer_exausted: bool = false,
+
+        fn internalReset(self: *Self) void {
+            self.seq_line_count = 0;
+            self.qual_line_count = 0;
+            self.seq_number_bases = 0;
+            self.qual_number_bases = 0;
+            self.bytes_per_line = 0;
+            self.bytes_per_line_expected = null;
+            self.bases_per_line = 0;
+            self.bases_per_line_expected = null;
+            self.buffer_exausted = false;
+        }
+
+        pub fn next(self: *Self) (Stream.ReadError || error{ BufferOverflow, RecordParseError })!?union(enum) {
+            begin: struct {buf: []const u8},
+            seq: struct {finished: bool, buf: []const u8},
+            qual: struct {finished: bool, buf: []const u8},
+            end: struct {
+             //   length: u32 = 0, // Total length of this reference sequence, in bases
+             //   offset: u64 = 0, // Offset in the FASTA/FASTQ file of this sequence's first base
+             //   line_base: u32 = 0, // The number of bases on each line
+             //   line_width: u32 = 0, // The number of bytes in each line, including the newline
+             //   qual_offset: ?u64 = null, // Offset of sequence's first quality within the FASTQ file
+            },
+        } {
             var reader = self.stream.reader();
 
-            var seq_line_count: u32 = 0;
-            var qual_line_count: u32 = 0;
-
-            var seq_number_bases: usize = 0;
-            var qual_number_bases: usize = 0;
-
-            var bytes_per_line: usize = 0;
-            var bytes_per_line_expected: ?usize = null;
-
-            var bases_per_line: usize = 0;
-            var bases_per_line_expected: ?usize = null;
-
+            self.pos = 0;
             while (true) {
                 switch (self.state) {
                     .start => {
                         const byte: u8 = reader.readByte() catch |err| switch (err) {
-                            error.EndOfStream => return false, // we just have a name so the buffer is malformed
+                            error.EndOfStream => return null, // we just have a name so the buffer is malformed
                             else => |e| return e,
                         };
                         self.state = switch (byte) {
@@ -95,163 +133,158 @@ pub fn FaReadIterator(comptime Stream: type, comptime options: FaReadIterOptions
                         };
                     },
                     .name => {
-                        reader.streamUntilDelimiter(stage.writer(), '\n', options.reserve_len) catch |err| switch (err) {
-                            error.EndOfStream => return false,
-                            error.StreamTooLong => return error.BufferOverflow,
-                            error.NoSpaceLeft => unreachable,
+                        var bufferStream = std.io.fixedBufferStream(&self.buffer);
+                        reader.streamUntilDelimiter(bufferStream.writer(), '\n', null) catch |err| switch (err) {
+                            error.EndOfStream => return null,
+                            error.NoSpaceLeft, error.StreamTooLong => return error.BufferOverflow,
                             else => |e| return e,
                         };
-                        try consumer.writeName(std.mem.trim(u8, stage.getWritten(), &std.ascii.whitespace));
-
-                        stage.reset();
+                        self.pos = @as(usize, bufferStream.pos);
                         self.state = .seq;
+                        return .{ .begin = .{
+                            .buf = self.buffer[0..self.pos]
+                        }};
                     },
-                    .seq => blk: {
-                        while (true) {
+                    .seq_end => {
+                        self.internalReset();
+                        self.state = .name;
+                        return .{ .end = .{}};
+                    },
+                    .seq =>  {
+                        if (!self.buffer_exausted) {
                             switch (reader.readByte() catch |err| switch (err) {
-                                error.EndOfStream => return false,
+                                error.EndOfStream => return null,
                             }) {
                                 '+' => {
+                                    self.bases_per_line = 0;
+                                    self.bytes_per_line = 0;
                                     self.state = .qual;
                                     try reader.skipUntilDelimiterOrEof('\n');
-                                    bases_per_line = 0;
-                                    bytes_per_line = 0;
-                                    break :blk;
+                                    return .{ .seq = .{
+                                        .finished = true,
+                                        .buf = self.buffer[0..self.pos]
+                                    }};
+
                                 },
                                 '>' => {
                                     if (self.format == .fastq)
                                         return error.RecordParseError;
-                                    self.state = .name; // return back to the name state
-                                    return true;
+                                    self.internalReset();
+                                    self.state = .seq_end;
+                                    return .{ .seq = .{.finished = true, .buf = self.buffer[0..self.pos]}};
                                 },
                                 else => |b| {
-                                    if (seq_line_count > 0) {
+                                    if (self.seq_line_count > 0) {
                                         // we're onto the next line need to check line_counts
-                                        if (bytes_per_line_expected) |count| {
-                                            if (bytes_per_line != count) return error.RecordParseError;
-                                        } else bytes_per_line_expected = bytes_per_line;
-                                        if (bases_per_line_expected) |count| {
-                                            if (bases_per_line != count) return error.RecordParseError;
-                                        } else bases_per_line_expected = bases_per_line;
+                                        if (self.bytes_per_line_expected) |count| {
+                                            if (self.bytes_per_line != count) return error.RecordParseError;
+                                        } else self.bytes_per_line_expected = self.bytes_per_line;
+                                        if (self.bases_per_line_expected) |count| {
+                                            if (self.bases_per_line != count) return error.RecordParseError;
+                                        } else self.bases_per_line_expected = self.bases_per_line;
                                     }
-
-                                    bases_per_line = 0;
-                                    bytes_per_line = 0;
-
-                                    const app: [1]u8 = .{b};
-                                    _ = stage.write(&app) catch |err| switch (err) {
-                                        error.NoSpaceLeft => unreachable,
-                                    };
+                                    self.bases_per_line = 0;
+                                    self.bytes_per_line = 0;
+                                    self.buffer[self.pos] = b;
+                                    self.pos += 1;
+                                    self.bytes_per_line += 1;
+                                    self.bases_per_line += 1;
+                                    self.seq_number_bases += 1;
                                 },
                             }
-                            same_line_chunk: while (true) {
-                                seq_line_count += 1;
-                                reader.streamUntilDelimiter(stage.writer(), '\n', options.reserve_len) catch |err| switch (err) {
-                                    error.EndOfStream => return false,
-                                    error.StreamTooLong => {
-                                        seq_line_count -= 1;
-                                        continue :same_line_chunk;
-                                    },
-                                    error.NoSpaceLeft => unreachable,
-                                    else => |e| return e,
-                                };
-                                const byte_buf = stage.getWritten();
-                                const bases_buf = std.mem.trim(u8, byte_buf, &std.ascii.whitespace);
+                        }
 
-                                bytes_per_line += byte_buf.len;
-                                bases_per_line += bases_buf.len;
+                        self.seq_line_count += 1;
+                        self.buffer_exausted = false;
 
-                                try consumer.writeSeq(bases_buf);
+                        var byte_buf = streamIntoArrayUntilDelim(reader, self.buffer[self.pos..], '\n') catch |err| switch(err) {
+                            error.EndOfStream => return null,
+                            error.StreamTooLong => blk: {
+                                self.seq_line_count -= 1;
+                                self.buffer_exausted = true;
+                                break :blk self.buffer[self.pos..];
+                            },
+                            else => |e| return e,
+                        };
+                        const bases_buf = std.mem.trimRight(u8, byte_buf, &std.ascii.whitespace);
 
-                                seq_number_bases += bases_buf.len;
-                                stage.reset();
-                                break :same_line_chunk;
-                            }
+                        self.bytes_per_line += byte_buf.len;
+                        self.bases_per_line += bases_buf.len;
+                        self.seq_number_bases += bases_buf.len;
+                        self.pos += bases_buf.len;
+
+                        if (self.buffer_exausted) {
+                            return .{ .seq = .{
+                                .finished = false,
+                                .buf = self.buffer[0..self.pos]
+                            }};
                         }
                     },
+                    .qual_end => {
+                        self.internalReset();
+                        self.state = .start;
+                        return .{ .end = .{}};
+                    },
                     .qual => {
-                        if (qual_line_count > 0) {
-                            if (bytes_per_line_expected) |count| {
-                                if (bytes_per_line != count) return error.RecordParseError;
-                            } else return error.RecordParseError;
-                            if (bases_per_line_expected) |count| {
-                                if (bases_per_line != count) return error.RecordParseError;
-                            } else return error.RecordParseError;
-
-                            bases_per_line = 0;
-                            bytes_per_line = 0;
+                        if (!self.buffer_exausted) {
+                            if (self.qual_number_bases == self.seq_number_bases) {
+                                if (self.seq_line_count != self.qual_line_count) return error.RecordParseError;
+                                self.state = .qual_end;
+                                return .{ .qual = .{.finished = true, .buf = self.buffer[0..self.pos]}};
+                            } else if (self.qual_number_bases > self.seq_number_bases) {
+                                return error.RecordParseError;
+                            }
+                            if (self.qual_line_count > 0) {
+                                if (self.bytes_per_line_expected) |count| {
+                                    if (self.bytes_per_line != count) return error.RecordParseError;
+                                } else return error.RecordParseError;
+                                if (self.bases_per_line_expected) |count| {
+                                    if (self.bases_per_line != count) return error.RecordParseError;
+                                } else return error.RecordParseError;
+                            }
+                            self.bases_per_line = 0;
+                            self.bytes_per_line = 0;
                         }
 
-                        same_line_chunk: while (true) {
-                            qual_line_count += 1;
-                            reader.streamUntilDelimiter(stage.writer(), '\n', options.reserve_len) catch |err| switch (err) {
-                                error.EndOfStream => return false,
-                                error.StreamTooLong => {
-                                    qual_line_count -= 1;
-                                    continue :same_line_chunk;
-                                },
-                                error.NoSpaceLeft => unreachable,
-                                else => |e| return e,
-                            };
-                            const byte_buf = stage.getWritten();
-                            const qual_buf = std.mem.trim(u8, byte_buf, &std.ascii.whitespace);
+                        self.qual_line_count += 1;
+                        self.buffer_exausted = false;
+                        
+                        var byte_buf = streamIntoArrayUntilDelim(reader, self.buffer[self.pos..], '\n') catch |err| switch(err) {
+                            error.EndOfStream => return null,
+                            error.StreamTooLong => blk: {
+                                self.seq_line_count -= 1;
+                                self.buffer_exausted = true;
+                                break :blk self.buffer[self.pos..];
+                            },
+                            else => |e| return e,
+                        };
+                        const bases_buf = std.mem.trimRight(u8, byte_buf, &std.ascii.whitespace);
 
-                            bytes_per_line += byte_buf.len;
-                            bases_per_line += qual_buf.len;
-
-                            try consumer.writeQual(qual_buf);
-                            qual_number_bases += qual_buf.len;
-                            stage.reset();
-                            break :same_line_chunk;
-                        }
-
-                        if (qual_number_bases == seq_number_bases) {
-                            if (seq_line_count != qual_line_count) return error.RecordParseError;
-                            self.state = .start;
-                            return true;
-                        } else if (qual_number_bases > seq_number_bases) {
-                            return error.RecordParseError;
+                        self.bytes_per_line += byte_buf.len;
+                        self.bases_per_line += bases_buf.len;
+                        self.qual_number_bases += bases_buf.len;
+                        self.pos += bases_buf.len;
+                        
+                        if (self.buffer_exausted) {
+                            return .{ .qual = .{.finished = false, .buf = self.buffer[0..self.pos]}};
                         }
                     },
                 }
             }
-            return false;
+            unreachable;
         }
     };
 }
 
-
-
-
-pub fn fastaReadIterator(stream: anytype, comptime options: FaReadIterOptions) FaReadIterator(@TypeOf(stream), options) {
+pub fn scanner(stream: anytype, comptime options: ReadIterOptions) Scanner(@TypeOf(stream), options) {
     return .{ .stream = stream };
 }
 
-//test "parse fai index and seek fq" {
-//    //const indexFile = @embedFile("./test/t3.fq.fai");
-//    const fq = @embedFile("./test/t3.fq");
-//    var fqStream = std.io.fixedBufferStream(fq);
-//    var fqReadIter = seq.fq.fqReader(std.testing.allocator, fqStream);
-//    defer fqReadIter.deinit();
-//    const TestCase = struct { index: seq.fai.FaiEntry(.fastq, .{}), seq: []const u8, qual: []const u8 };
-//
-//    const test_cases =
-//        [_]TestCase{
-//        .{ .index = .{ .name = "FAKE0005_1", .length = 63, .offset = 85, .line_base = 63, .line_width = 64, .qual_offset = 151 }, .seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACG", .qual = "@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~" },
-//        .{ .index = .{ .name = "FAKE0006_4", .length = 63, .offset = 1590, .line_base = 63, .line_width = 64, .qual_offset = 1656 }, .seq = "GCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA", .qual = "~}|{zyxwvutsrqponmlkjihgfedcba`_^]\\[ZYXWVUTSRQPONMLKJIHGFEDCBA@" },
-//    };
-//
-//    for (test_cases) |case| {
-//        const record = try fqReadIter.readUsingIndex(case.index, .{});
-//        try testing.expectEqualStrings(case.seq, record.seq);
-//        try testing.expectEqualStrings(case.qual, record.qual);
-//    }
-//}
 
-test "read fq records t1.fq" {
+test "read fq scanner" {
     const file = @embedFile("./test/t1.fq");
     var stream = std.io.fixedBufferStream(file);
-    var iter = seq.fa.fastaReadIterator(stream, .{});
+    var scan = seq.fa.scanner(stream, .{});
     const TestCase = struct { name: []const u8, sequence: []const u8, quality: []const u8 };
 
     // zig fmt: off
@@ -271,55 +304,32 @@ test "read fq records t1.fq" {
             .quality = "HGHHGHIIHIIIIIIHHHIIHIIIIIHGHCHIHIIHIIHIIIIIIIIIHIGHIEHIHIIG<FEHHHIHHIIIIIIHIFFHHHHIIIIIHHHHGHFEHHIHHHIHEHHFHHHIHIIIIIIIHIHDHHHHHEHHIIGIIHHIIGHHHIIGDDAGGHHFHHHIHICHHHGH,GHHHHGCEHEG?@6@G?-@>HHHHHHHDEH<@H-@CDD>:E?@GHEF-@E:@H+@-@@" 
         } 
     };
-    // zig fmt: on 
+    // zig fmt: on
 
-    const FaTestRecord = struct {
-        const Self = @This();
-
-        name: std.ArrayListUnmanaged(u8),
-        qual: std.ArrayListUnmanaged(u8),
-        seq: std.ArrayListUnmanaged(u8),
-
-        pub const StreamError = error{OutOfMemory};
-        pub const FaStreamConsumer = seq.consumer.SeqQualConsumer(*Self, StreamError, writeName, writeSeq, writeQual);
-        fn writeName(self: *Self, buf: []const u8) StreamError!void {
-            try self.name.appendSlice(std.testing.allocator, buf);
-        }
-        fn writeQual(self: *Self, buf: []const u8) StreamError!void {
-            try self.qual.appendSlice(std.testing.allocator, buf);
-        }
-        fn writeSeq(self: *Self, buf: []const u8) StreamError!void {
-            try self.seq.appendSlice(std.testing.allocator, buf);
-        }
-    };
-    var faTestRecord: FaTestRecord = .{ .name = .{}, .seq = .{}, .qual = .{} };
+    var name = std.ArrayList(u8).init(std.testing.allocator);
+    var sequence = std.ArrayList(u8).init(std.testing.allocator);
+    var quality = std.ArrayList(u8).init(std.testing.allocator);
     defer {
-        faTestRecord.qual.deinit(std.testing.allocator);
-        faTestRecord.seq.deinit(std.testing.allocator);
-        faTestRecord.name.deinit(std.testing.allocator);
+        name.deinit();
+        sequence.deinit();
+        quality.deinit();
     }
 
-    var con: FaTestRecord.FaStreamConsumer = .{ .context = &faTestRecord };
     for (test_cases) |case| {
-        if (try iter.next(con)) {
-            try testing.expectEqualStrings(case.name, faTestRecord.name.items);
-            try testing.expectEqualStrings(case.sequence, faTestRecord.seq.items);
-            try testing.expectEqualStrings(case.quality, faTestRecord.qual.items);
-        } else try testing.expect(false);
-        faTestRecord.qual.clearRetainingCapacity();
-        faTestRecord.seq.clearRetainingCapacity();
-        faTestRecord.name.clearRetainingCapacity();
+        blk: while (try scan.next()) |sec| {
+            switch (sec) {
+                .begin => |value| try name.appendSlice(value.buf),
+                .seq => |value| try sequence.appendSlice(value.buf),
+                .qual => |value| try quality.appendSlice(value.buf),
+                .end => break :blk,
+            }
+        }
+        try testing.expectEqualStrings(case.name, name.items);
+        try testing.expectEqualStrings(case.quality, quality.items);
+        try testing.expectEqualStrings(case.sequence, sequence.items);
+  
+        name.clearRetainingCapacity();
+        sequence.clearRetainingCapacity();
+        quality.clearRetainingCapacity();
     }
 }
-
-//test "writing fq to buffer" {
-//    var buf = std.ArrayList(u8).init(std.testing.allocator);
-//    defer buf.deinit();
-//    var writer = seq.fq.fqWriter(&buf, .{});
-//    try writer.write_record(.{
-//        .name = "HWI-D00523:240:HF3WGBCXX:1:1101:2574:2226 1:N:0:CTGTAG",
-//        .seq = "TGAGGAATATTGGTCAATGGGCGCGAGCCTGAACCAGCCAAGTAGCGTGAAGGATGACTGCCCTACGGGTTGTAAACTTCTTTTATAAAGGAATAAAGTGAGGCACGTGTGCCTTTTTGTATGTACTTTATGAATAAGGATCGGCTAACTCCGTGCCAGCAGCCGCGGTAATACGGAGGATCCGAGCGTTATCCGGATTTATTGGGTTTAAAGGGTGCGCAGGCGGT",
-//        .qual = "HIHIIIIIHIIHGHHIHHIIIIIIIIIIIIIIIHHIIIIIHHIHIIIIIGIHIIIIHHHHHHGHIHIIIIIIIIIIIGHIIIIIGHIIIIHIIHIHHIIIIHIHHIIIIIIIGIIIIIIIHIIIIIGHIIIIHIIIH?DGHEEGHIIIIIIIIIIIHIIHIIIHHIIHIHHIHCHHIIHGIHHHHHHH<GG?B@EHDE-BEHHHII5B@GHHF?CGEHHHDHIHIIH",
-//    });
-//    try testing.expectEqualStrings(buf.items, @embedFile("./test/t2.fq"));
-//}

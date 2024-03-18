@@ -1,7 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
 
-pub const consumer = @import("consumer.zig"); 
 pub const fai = @import("./fai.zig"); 
 pub const fa = @import("./fa.zig");
 
