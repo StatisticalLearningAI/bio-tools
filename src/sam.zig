@@ -84,26 +84,38 @@ pub fn Scanner(comptime Stream: type, comptime options: ReaderOptions) type {
 
         state: enum {
             header,
-            alignment,
+            begin_alignment, // consume the required field
+            seq, // consume theseq
+            qual, // consume the qual
+            end_alignment, // finish processing and return back to begin_alignment
+
             header_hd,
-            header_sr,
+            header_sq,
+            header_rg,
+            header_pg,
+            header_co,
         } = .header,
         buffer: [options.reserve_len]u8 = undefined,
-        pos: usize = 0,
-        line: usize = 0,
-        col: usize = 0,
+        consume_pos: usize = 0,
 
         // HD header
         minor_version: u16 = 0,
         major_version: u16 = 0,
 
-        pub fn next(self: *Self) (error{ ParseError, Overflow })!?union(enum) {
+        pub const Result = union(enum) {
             // header meta data
             header_meta: struct { version: struct {
                 major: u16,
                 minor: u16,
             }, sub_sorting: struct { sort_order: SortOrder, tags: std.BoundedArray([]const u8, 16) }, sort_order: SortOrder, group_alignment: GroupAlignment },
-            ref_sequence: struct {},
+            ref_sequence: struct {
+                //name: []const u8,
+                // locus: struct {
+
+                // }
+            },
+            program: struct {},
+            comment: []const u8,
             read_group: struct {},
 
             // alignment
@@ -111,43 +123,174 @@ pub fn Scanner(comptime Stream: type, comptime options: ReaderOptions) type {
             alignment_seq: struct {},
             alignment_qual: struct {},
             end_alignment: struct {},
-        } {
+        };
+
+        fn processBeginAlignment() Result {}
+
+        fn streamReadColumn(self: *Self, buffer: []u8) anyerror!struct { buf: []const u8, last: bool } {
             var reader = self.stream.reader();
+            var pos: usize = 0;
             while (true) {
-                self.pos = 0;
+                const byte: u8 = reader.readByte() catch |err| switch (err) {
+                    error.EndOfStream => return .{ .buf = buffer[0..pos], .last= true }, // the buffer is exausted
+                    else => |e| return e,
+                };
+                switch (byte) {
+                    // skip \r
+                    std.ascii.control_code.cr => {},
+                    // horizontal tab
+                    std.ascii.control_code.ht, std.ascii.control_code.lf => return .{ .buf = buffer[0..pos], .last= byte == std.ascii.control_code.lf },
+                    else => {
+                        buffer[pos] = byte;
+                        pos += 1;
+                    },
+                }
+            }
+        }
+
+        pub fn next(self: *Self) (error{ ParseError, Overflow })!?Result {
+            var reader = self.stream.reader();
+
+            while (true) {
                 switch (self.state) {
                     .header => {
+                        var name_column = self.streamReadColumn(self.buffer[0..]) catch return error.ParseError;
+                        if (std.mem.eql(u8, name_column.buf, "@HD")) {
+                            var sub_sorting: SortOrder = .unknown;
+                            var sub_sorting_tags: std.BoundedArray([]const u8, 16) = .{};
+                            var sort_order: SortOrder = .unknown;
+                            var group_alignment: GroupAlignment = .none;
+                            var begin: usize = 0;
+                            blk: while (true) {
+                                var entry_column = self.streamReadColumn(self.buffer[begin..]) catch return error.ParseError;
+                                var splitIter = std.mem.splitSequence(u8, entry_column.buf, ":");
+                                if (splitIter.next()) |key| {
+                                    if (std.mem.eql(u8, key, "VN")) {
+                                        if (splitIter.next()) |val| {
+                                            var verion_iter = std.mem.splitSequence(u8, val, ".");
+                                            if (verion_iter.next()) |major_str| {
+                                                self.major_version = std.fmt.parseUnsigned(u16, major_str, 10) catch return error.ParseError;
+                                            } else return error.ParseError;
+                                            if (verion_iter.next()) |minor_str| {
+                                                self.minor_version = std.fmt.parseUnsigned(u16, minor_str, 10) catch return error.ParseError;
+                                            } else return error.ParseError;
+                                        } else return error.ParseError;
+                                    } else if (std.mem.eql(u8, key, "SO")) {
+                                        if (splitIter.next()) |val| {
+                                            if (std.mem.eql(u8, val, "unsorted")) {
+                                                sort_order = .unsorted;
+                                            } else if (std.mem.eql(u8, val, "queryname")) {
+                                                sort_order = .query_name;
+                                            } else if (std.mem.eql(u8, val, "coordinate")) {
+                                                sort_order = .coordinate;
+                                            } else return error.ParseError;
+                                        } else return error.ParseError;
+                                    } else if (std.mem.eql(u8, key, "GO")) {
+                                        if (splitIter.next()) |val| {
+                                            if (std.mem.eql(u8, val, "none")) {
+                                                group_alignment = .none;
+                                            } else if (std.mem.eql(u8, val, "query")) {
+                                                group_alignment = .query;
+                                            } else if (std.mem.eql(u8, val, "reference")) {
+                                                group_alignment = .reference;
+                                            } else return error.ParseError;
+                                        } else return error.ParseError;
+                                    } else if (std.mem.eql(u8, key, "SS")) {
+                                        if (splitIter.next()) |val| {
+                                            if (std.mem.eql(u8, val, "unsorted")) {
+                                                sub_sorting = .unsorted;
+                                            } else if (std.mem.eql(u8, val, "queryname")) {
+                                                sub_sorting = .query_name;
+                                            } else if (std.mem.eql(u8, val, "coordinate")) {
+                                                sub_sorting = .coordinate;
+                                            } else return error.ParseError;
+                                        } else return error.ParseError;
+                                        while (splitIter.next()) |val| {
+                                            try sub_sorting_tags.append(val);
+                                        }
+                                        begin += entry_column.buf.len; // save this string since its referenced for sub sorting tags
+                                    }
+                                    if (entry_column.last) break :blk;
+                                }
+                            }
+                            return .{ 
+                                .header_meta = .{ 
+                                    .version = .{
+                                        .major = self.major_version,
+                                        .minor = self.minor_version,
+                                    }, 
+                                    .sub_sorting = .{ 
+                                        .sort_order = sub_sorting, 
+                                        .tags = sub_sorting_tags 
+                                    }, 
+                                    .sort_order = sort_order, 
+                                    .group_alignment = group_alignment 
+                                } 
+                            };
+                        } else if (std.mem.eql(u8, name_column.buf, "@SQ")) {
+                            self.state = .header_sq;
+                            //break :blk;
+                        } else if (std.mem.eql(u8, name_column.buf, "@RG")) {
+                            self.state = .header_rg;
+                            //break :blk;
+                        } else if (std.mem.eql(u8, name_column.buf, "@PG")) {
+                            self.state = .header_pg;
+                            //break :blk;
+                        } else if (std.mem.eql(u8, name_column.buf, "@CO")) {
+                            self.state = .header_co;
+                            //break :blk;
+                        } else {
+                            self.state = .begin_alignment;
+                            //break :blk;
+                        }
+
+                        // var pos: usize = 0;
+                        // blk: while (true) {
+                        //     const byte: u8 = reader.readByte() catch |err| switch (err) {
+                        //         error.EndOfStream => return null, // the buffer is exausted
+                        //         else => |e| return e,
+                        //     };
+                        //     switch (byte) {
+                        //         // skip \r
+                        //         std.ascii.control_code.cr => break,
+                        //         // horizontal tab
+                        //         std.ascii.control_code.ht, std.ascii.control_code.lf => {
+                        //         },
+                        //         else => {
+                        //             self.buffer[pos] = byte;
+                        //             pos += 1;
+                        //         },
+                        //     }
+                        // }
+                    },
+                    .header_co => {
+                        var pos: usize = 0;
                         blk: while (true) {
                             const byte: u8 = reader.readByte() catch |err| switch (err) {
-                                error.EndOfStream => return null, // the buffer is exausted
+                                error.EndOfStream => break :blk, // the buffer is exausted
                                 else => |e| return e,
                             };
-
                             switch (byte) {
                                 // skip \r
-                                std.ascii.control_code.cr => break,
+                                std.ascii.control_code.cr => {},
                                 // horizontal tab
-                                std.ascii.control_code.ht, std.ascii.control_code.lf => {
-                                    if (std.mem.eql(u8, self.buffer[0..self.pos], "@HD")) {
-                                        self.state = .header_hd;
-                                        self.pos = 0; // reset position
-                                        break :blk;
-                                    } else if (std.mem.eql(u8, self.buffer[0..self.pos], "@SQ")) {}
-                                    self.col += 1;
-                                },
+                                std.ascii.control_code.lf => break :blk,
                                 else => {
-                                    self.buffer[self.pos] = byte;
-                                    self.pos += 1;
+                                    self.buffer[pos] = byte;
+                                    pos += 1;
                                 },
                             }
                         }
+
+                        self.state = .header;
+                        return .{ .comment = self.buffer[0..pos] };
                     },
-                    .header_hd => {
-                        var reserved_pos: usize = 0; // stash some values
-                        var sub_sorting: SortOrder = .unknown;
-                        var sub_sorting_tags: std.BoundedArray([]const u8, 16) = .{};
-                        var sort_order: SortOrder = .unknown;
-                        var group_alignment: GroupAlignment = .none;
+                    .header_sq => {
+                        var sequence_len: u32 = 0;
+                        var name_str: ?[]const u8 = null;
+                        var begin: usize = 0;
+                        var pos: usize = 0;
+
                         blk: while (true) {
                             const byte: u8 = reader.readByte() catch |err| switch (err) {
                                 error.EndOfStream => break :blk, // the buffer is exausted
@@ -158,7 +301,109 @@ pub fn Scanner(comptime Stream: type, comptime options: ReaderOptions) type {
                                 std.ascii.control_code.cr => break,
                                 // horizontal tab
                                 std.ascii.control_code.ht, std.ascii.control_code.lf => {
-                                    var splitIter = std.mem.splitSequence(u8, self.buffer[0..self.pos], ":");
+                                    var splitIter = std.mem.splitSequence(u8, self.buffer[begin..pos], ":");
+                                    if (splitIter.next()) |key| {
+                                        if (std.mem.eql(u8, key, "SN")) {
+                                            if (splitIter.next()) |val| {
+                                                name_str = val;
+                                                begin = pos;
+                                            } else return error.ParseError;
+                                        } else if (std.mem.eql(u8, key, "LN")) {
+                                            if (splitIter.next()) |val| {
+                                                sequence_len = std.fmt.parseUnsigned(u32, val, 10) catch return error.ParseError;
+                                            } else return error.ParseError;
+                                        } else if (std.mem.eql(u8, key, "AH")) {} else if (std.mem.eql(u8, key, "AN")) {} else if (std.mem.eql(u8, key, "AS")) {} else if (std.mem.eql(u8, key, "M5")) {} else if (std.mem.eql(u8, key, "SP")) {} else if (std.mem.eql(u8, key, "TP")) {} else if (std.mem.eql(u8, key, "UR")) {}
+                                    }
+                                    pos = begin; // move the pos
+
+                                    if (std.ascii.control_code.lf == byte) {
+                                        break :blk;
+                                    }
+                                },
+                                else => {
+                                    self.buffer[pos] = byte;
+                                    pos += 1;
+                                },
+                            }
+                        }
+                        self.state = .header;
+                        return .{ .ref_sequence = .{} };
+                    },
+                    .header_rg => {
+                        var begin: usize = 0;
+                        var pos: usize = 0;
+
+                        blk: while (true) {
+                            const byte: u8 = reader.readByte() catch |err| switch (err) {
+                                error.EndOfStream => break :blk, // the buffer is exausted
+                                else => |e| return e,
+                            };
+                            switch (byte) {
+                                // skip \r
+                                std.ascii.control_code.cr => {},
+                                // horizontal tab
+                                std.ascii.control_code.ht, std.ascii.control_code.lf => {
+                                    var splitIter = std.mem.splitSequence(u8, self.buffer[begin..pos], ":");
+                                    if (splitIter.next()) |key| {
+                                        if (std.mem.eql(u8, key, "ID")) {} else if (std.mem.eql(u8, key, "BC")) {} else if (std.mem.eql(u8, key, "CN")) {} else if (std.mem.eql(u8, key, "DS")) {} else if (std.mem.eql(u8, key, "DT")) {} else if (std.mem.eql(u8, key, "FO")) {} else if (std.mem.eql(u8, key, "KS")) {} else if (std.mem.eql(u8, key, "LB")) {} else if (std.mem.eql(u8, key, "PG")) {} else if (std.mem.eql(u8, key, "PI")) {} else if (std.mem.eql(u8, key, "PL")) {} else if (std.mem.eql(u8, key, "PM")) {} else if (std.mem.eql(u8, key, "PU")) {} else if (std.mem.eql(u8, key, "SM")) {}
+                                    }
+                                    pos = begin; // move the pos
+
+                                    if (std.ascii.control_code.lf == byte) {
+                                        break :blk;
+                                    }
+                                },
+                                else => {
+                                    self.buffer[pos] = byte;
+                                    pos += 1;
+                                },
+                            }
+                        }
+
+                        self.state = .header;
+                        return .{ .ref_sequence = .{} };
+                    },
+                    .header_pg => {
+                        var pos: usize = 0;
+                        blk: while (true) {
+                            const byte: u8 = reader.readByte() catch |err| switch (err) {
+                                error.EndOfStream => break :blk, // the buffer is exausted
+                                else => |e| return e,
+                            };
+                            switch (byte) {
+                                // skip \r
+                                std.ascii.control_code.cr => {},
+                                // horizontal tab
+                                std.ascii.control_code.lf => break :blk,
+                                else => {
+                                    self.buffer[pos] = byte;
+                                    pos += 1;
+                                },
+                            }
+                        }
+
+                        self.state = .header;
+                        return .{ .program = .{} };
+                    },
+                    .header_hd => {
+                        var sub_sorting: SortOrder = .unknown;
+                        var sub_sorting_tags: std.BoundedArray([]const u8, 16) = .{};
+                        var sort_order: SortOrder = .unknown;
+                        var group_alignment: GroupAlignment = .none;
+                        var begin: usize = 0;
+                        var pos: usize = 0;
+
+                        blk: while (true) {
+                            const byte: u8 = reader.readByte() catch |err| switch (err) {
+                                error.EndOfStream => break :blk, // the buffer is exausted
+                                else => |e| return e,
+                            };
+                            switch (byte) {
+                                // skip \r
+                                std.ascii.control_code.cr => break,
+                                // horizontal tab
+                                std.ascii.control_code.ht, std.ascii.control_code.lf => {
+                                    var splitIter = std.mem.splitSequence(u8, self.buffer[begin..pos], ":");
                                     if (splitIter.next()) |key| {
                                         if (std.mem.eql(u8, key, "VN")) {
                                             if (splitIter.next()) |val| {
@@ -203,40 +448,28 @@ pub fn Scanner(comptime Stream: type, comptime options: ReaderOptions) type {
                                             while (splitIter.next()) |val| {
                                                 try sub_sorting_tags.append(val);
                                             }
-                                            reserved_pos = self.pos; // save this string since its referenced for sub sorting tags
+                                            begin = pos; // save this string since its referenced for sub sorting tags
                                         }
                                     }
-                                    self.col += 1;
-                                    self.pos = reserved_pos; // move the pos
+                                    pos = begin; // move the pos consumed some amount of the buffer for something else
 
                                     if (std.ascii.control_code.lf == byte) {
                                         break :blk;
                                     }
                                 },
                                 else => {
-                                    self.buffer[self.pos] = byte;
-                                    self.pos += 1;
+                                    self.buffer[pos] = byte;
+                                    pos += 1;
                                 },
                             }
                         }
                         self.state = .header;
-                        self.col = 0;
-                        return .{ 
-                            .header_meta = .{ 
-                                .version = .{
-                                    .major = self.major_version,
-                                    .minor = self.minor_version,
-                                }, 
-                                .sub_sorting = .{ 
-                                    .sort_order = sub_sorting, 
-                                    .tags = sub_sorting_tags 
-                                }, 
-                                .sort_order = sort_order, 
-                                .group_alignment = group_alignment 
-                            } 
-                        };
+                        return .{ .header_meta = .{ .version = .{
+                            .major = self.major_version,
+                            .minor = self.minor_version,
+                        }, .sub_sorting = .{ .sort_order = sub_sorting, .tags = sub_sorting_tags }, .sort_order = sort_order, .group_alignment = group_alignment } };
                     },
-                    .alignment => {},
+                    .begin_alignment => {},
                     else => unreachable,
                 }
             }
