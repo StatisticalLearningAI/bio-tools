@@ -102,31 +102,6 @@ pub fn Scanner(comptime Stream: type, comptime options: ReaderOptions) type {
         minor_version: u16 = 0,
         major_version: u16 = 0,
 
-        pub const Result = union(enum) {
-            // header meta data
-            header_meta: struct { version: struct {
-                major: u16,
-                minor: u16,
-            }, sub_sorting: struct { sort_order: SortOrder, tags: std.BoundedArray([]const u8, 16) }, sort_order: SortOrder, group_alignment: GroupAlignment },
-            ref_sequence: struct {
-                //name: []const u8,
-                // locus: struct {
-
-                // }
-            },
-            program: struct {},
-            comment: []const u8,
-            read_group: struct {},
-
-            // alignment
-            begin_alignment: struct {},
-            alignment_seq: struct {},
-            alignment_qual: struct {},
-            end_alignment: struct {},
-        };
-
-        fn processBeginAlignment() Result {}
-
         fn streamReadColumn(self: *Self, buffer: []u8) anyerror!struct { buf: []const u8, last: bool } {
             var reader = self.stream.reader();
             var pos: usize = 0;
@@ -148,9 +123,29 @@ pub fn Scanner(comptime Stream: type, comptime options: ReaderOptions) type {
             }
         }
 
-        pub fn next(self: *Self) (error{ ParseError, Overflow })!?Result {
-            var reader = self.stream.reader();
+        pub fn next(self: *Self) (error{ ParseError, Overflow })!?union(enum) {
+            // header meta data
+            header_meta: struct { version: struct {
+                major: u16,
+                minor: u16,
+            }, sub_sorting: struct { sort_order: SortOrder, tags: std.BoundedArray([]const u8, 16) }, sort_order: SortOrder, group_alignment: GroupAlignment },
+            ref_sequence: struct {
+                //name: []const u8,
+                // locus: struct {
 
+                // }
+            },
+            program: struct {},
+            comment: []const u8,
+            read_group: struct {},
+
+            // alignment
+            begin_alignment: struct {},
+            alignment_seq: struct {},
+            alignment_qual: struct {},
+            end_alignment: struct {},
+        }{
+            var reader = self.stream.reader();
             while (true) {
                 switch (self.state) {
                     .header => {
